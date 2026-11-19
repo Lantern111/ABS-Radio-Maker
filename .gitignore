@@ -1,0 +1,5 @@
+.build/
+dist/
+xcuserdata/
+.DS_Store
+*-update-key*
