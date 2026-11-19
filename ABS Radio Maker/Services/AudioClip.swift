@@ -110,3 +110,50 @@ struct AudioClip: Sendable {
         ]
     }
 }
+
+/// The original recording, decoded once and then kept in a temporary file rather than in memory. The file is mapped,
+/// so the system reads in only the parts in use and can let them go again; a whole show would otherwise hold over half
+/// a gigabyte for as long as it's open.
+final class SourceAudio: @unchecked Sendable {
+    let sampleRate: Double
+    let channelCount: Int
+    let frameCount: Int
+    private let url: URL
+    private let data: Data
+
+    var duration: Double { Double(frameCount) / sampleRate }
+
+    /// Writes the clip's channels one after another as raw 32-bit samples.
+    init(_ clip: AudioClip) throws {
+        sampleRate = clip.sampleRate
+        channelCount = clip.channels.count
+        frameCount = clip.frameCount
+        url = FileManager.default.temporaryDirectory.appending(path: "source-\(UUID().uuidString).raw")
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: url)
+        for channel in clip.channels {
+            try channel.withUnsafeBytes { bytes in
+                let chunk = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: bytes.baseAddress!), count: bytes.count, deallocator: .none)
+                try handle.write(contentsOf: chunk)
+            }
+        }
+        try handle.close()
+        data = try Data(contentsOf: url, options: .alwaysMapped)
+    }
+
+    deinit {
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    /// A copy of some of the frames, in memory, ready to edit.
+    func clip(_ frames: Range<Int>) -> AudioClip {
+        let frames = frames.clamped(to: 0..<frameCount)
+        let channels = (0..<channelCount).map { channel in
+            data.withUnsafeBytes { bytes in
+                let samples = bytes.baseAddress!.assumingMemoryBound(to: Float.self) + channel * frameCount
+                return Array(UnsafeBufferPointer(start: samples + frames.lowerBound, count: frames.count))
+            }
+        }
+        return AudioClip(channels: channels, sampleRate: sampleRate)
+    }
+}

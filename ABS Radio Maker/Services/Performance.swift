@@ -14,8 +14,6 @@ struct Performance: Sendable {
     var blinking: [Bool]
     /// While listening, whether the eyes are shut to enjoy the song.
     var eyesClosed: [Bool]
-    /// Talk and song stretches in the edited audio's time, for the timeline.
-    var segments: [ContentSegment]
 
     var frameCount: Int { mouth.count }
     var duration: Double { Double(frameCount) / Double(framesPerSecond) }
@@ -29,8 +27,7 @@ struct Performance: Sendable {
             energy: Array(repeating: 0, count: count),
             listening: Array(repeating: 0, count: count),
             blinking: blinks(count: count, framesPerSecond: framesPerSecond),
-            eyesClosed: Array(repeating: false, count: count),
-            segments: [ContentSegment(start: 0, end: seconds, isMusic: false)]
+            eyesClosed: Array(repeating: false, count: count)
         )
     }
 
@@ -104,24 +101,13 @@ struct Performance: Sendable {
             listening[frame] = amount
         }
 
-        var segments = [ContentSegment]()
-        for frame in 0..<count {
-            let time = Double(frame) / fps
-            if let last = segments.last, last.isMusic == isMusic[frame] {
-                segments[segments.count - 1].end = time + 1 / fps
-            } else {
-                segments.append(ContentSegment(start: time, end: time + 1 / fps, isMusic: isMusic[frame]))
-            }
-        }
-
         return Performance(
             framesPerSecond: framesPerSecond,
             mouth: mouth,
             energy: energy,
             listening: listening,
             blinking: blinks(count: count, framesPerSecond: framesPerSecond),
-            eyesClosed: eyesClosed(isMusic: isMusic, framesPerSecond: framesPerSecond, style: listeningEyes),
-            segments: segments
+            eyesClosed: eyesClosed(isMusic: isMusic, framesPerSecond: framesPerSecond, style: listeningEyes)
         )
     }
 

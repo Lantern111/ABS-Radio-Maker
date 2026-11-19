@@ -26,6 +26,18 @@ struct TimeMap: Sendable {
         let piece = pieces[low]
         return piece.sourceStart + min(max(outputTime - piece.outputStart, 0), piece.length)
     }
+
+    /// Where a time in the original recording plays in the edited audio. A time that was cut out lands where the
+    /// audio picks up again.
+    func outputTime(atSource sourceTime: Double) -> Double {
+        guard let first = pieces.first else { return sourceTime }
+        if sourceTime <= first.sourceStart { return 0 }
+        for piece in pieces {
+            if sourceTime < piece.sourceStart { return piece.outputStart }
+            if sourceTime <= piece.sourceStart + piece.length { return piece.outputStart + sourceTime - piece.sourceStart }
+        }
+        return outputDuration
+    }
 }
 
 struct ProcessedAudio: Sendable {
@@ -37,19 +49,38 @@ struct ProcessedAudio: Sendable {
 
 /// Applies the edits in AudioEditOptions to a recording.
 enum AudioProcessor {
-    static func process(_ source: AudioClip, options: AudioEditOptions, progress: (Double) -> Void = { _ in }) -> ProcessedAudio {
-        let rate = source.sampleRate
-
+    /// The frames of the original recording that the trim points keep.
+    static func keptFrames(frameCount: Int, sampleRate rate: Double, options: AudioEditOptions) -> Range<Int> {
         var start = Int((options.trimStart * rate).rounded())
-        var end = options.trimEnd.map { Int(($0 * rate).rounded()) } ?? source.frameCount
-        start = min(max(start, 0), source.frameCount)
-        end = min(max(end, start), source.frameCount)
+        var end = options.trimEnd.map { Int(($0 * rate).rounded()) } ?? frameCount
+        start = min(max(start, 0), frameCount)
+        end = min(max(end, start), frameCount)
         if end - start < Int(rate) {
             // Less than a second left means the trim points crossed. Keep everything rather than nothing.
-            start = 0
-            end = source.frameCount
+            return 0..<frameCount
         }
-        var channels = source.channels.map { Array($0[start..<end]) }
+        return start..<end
+    }
+
+    static func process(_ source: AudioClip, options: AudioEditOptions, progress: (Double) -> Void = { _ in }) -> ProcessedAudio {
+        let kept = keptFrames(frameCount: source.frameCount, sampleRate: source.sampleRate, options: options)
+        let trimmed = AudioClip(channels: source.channels.map { Array($0[kept]) }, sampleRate: source.sampleRate)
+        return process(trimmed: trimmed, startingAt: kept.lowerBound, options: options, progress: progress)
+    }
+
+    static func process(_ source: SourceAudio, options: AudioEditOptions, progress: (Double) -> Void = { _ in }) -> ProcessedAudio {
+        let kept = keptFrames(frameCount: source.frameCount, sampleRate: source.sampleRate, options: options)
+        return process(trimmed: source.clip(kept), startingAt: kept.lowerBound, options: options, progress: progress)
+    }
+
+    /// Edits audio that's already been trimmed. `start` is where it begins in the original recording, in frames.
+    ///
+    /// The clip is consumed so its samples are edited where they are. Copying them first would hold a second copy of a
+    /// whole show, over half a gigabyte, for as long as the edit takes.
+    static func process(trimmed: consuming AudioClip, startingAt start: Int, options: AudioEditOptions, progress: (Double) -> Void) -> ProcessedAudio {
+        let rate = trimmed.sampleRate
+        let end = start + trimmed.frameCount
+        var channels = (consume trimmed).channels
         progress(0.1)
 
         if options.removesRumble {

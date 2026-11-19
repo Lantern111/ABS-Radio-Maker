@@ -9,15 +9,16 @@ import ImageIO
 final class FrameRenderer: @unchecked Sendable {
     let size: CGSize
 
-    private struct Placed {
+    /// A picture scaled for the screen, and where it goes, with the origin at the top left.
+    struct Placed {
         let image: CGImage
-        /// Where it goes, with the origin at the top left.
         let rect: CGRect
     }
 
-    private let background: CGImage?
-    private let musicBackground: CGImage?
-    private let desk: Placed?
+    /// The pictures scaled to fill the screen. The preview shows these as layers; the export draws them.
+    let background: CGImage?
+    let musicBackground: CGImage?
+    let desk: Placed?
     private let poses: [LayerSlot: Placed]
     /// The bottom middle of the character, which it sways around.
     private let pivot: CGPoint
@@ -67,7 +68,7 @@ final class FrameRenderer: @unchecked Sendable {
             context.restoreGState()
         }
 
-        if let character = poses[pose.drawing] ?? poses[.character] {
+        if let character = character(for: pose.drawing) {
             drawCharacter(character, pose: pose, settings: settings, context: context)
         }
 
@@ -76,13 +77,14 @@ final class FrameRenderer: @unchecked Sendable {
         }
     }
 
-    func makeImage(pose: Performance.Pose, settings: StudioSettings, quality: CGInterpolationQuality = .medium) -> CGImage? {
-        guard let context = Self.makeContext(size: size) else { return nil }
-        draw(in: context, pose: pose, settings: settings, quality: quality)
-        return context.makeImage()
+    /// The character's drawing for a pose, falling back to the plain drawing when that pose has no picture.
+    func character(for drawing: LayerSlot) -> Placed? {
+        poses[drawing] ?? poses[.character]
     }
 
-    private func drawCharacter(_ character: Placed, pose: Performance.Pose, settings: StudioSettings, context: CGContext) {
+    /// Where the character's drawing goes for a pose: its position and size from the settings, then the sway around its
+    /// feet. Works on top-left-origin screen coordinates.
+    func characterTransform(pose: Performance.Pose, settings: StudioSettings) -> CGAffineTransform {
         let scale = settings.characterScale
         let offset = CGPoint(x: settings.characterOffsetX * size.width, y: settings.characterOffsetY * size.height)
         // The character grows and shrinks around the bottom middle of the screen, where it sits behind the desk.
@@ -92,14 +94,24 @@ final class FrameRenderer: @unchecked Sendable {
             y: anchor.y + (pivot.y - size.height) * scale
         )
         let lift = pose.lift * size.height / 1080
+        return CGAffineTransform.identity
+            .translatedBy(x: feet.x, y: feet.y + lift)
+            .rotated(by: pose.rotation)
+            .translatedBy(x: -feet.x, y: -feet.y)
+            .translatedBy(x: anchor.x, y: anchor.y)
+            .scaledBy(x: scale, y: scale)
+            .translatedBy(x: -size.width / 2, y: -size.height)
+    }
 
+    func makeImage(pose: Performance.Pose, settings: StudioSettings, quality: CGInterpolationQuality = .medium) -> CGImage? {
+        guard let context = Self.makeContext(size: size) else { return nil }
+        draw(in: context, pose: pose, settings: settings, quality: quality)
+        return context.makeImage()
+    }
+
+    private func drawCharacter(_ character: Placed, pose: Performance.Pose, settings: StudioSettings, context: CGContext) {
         context.saveGState()
-        context.translateBy(x: feet.x, y: feet.y + lift)
-        context.rotate(by: pose.rotation)
-        context.translateBy(x: -feet.x, y: -feet.y)
-        context.translateBy(x: anchor.x, y: anchor.y)
-        context.scaleBy(x: scale, y: scale)
-        context.translateBy(x: -size.width / 2, y: -size.height)
+        context.concatenate(characterTransform(pose: pose, settings: settings))
         draw(character.image, in: character.rect, context: context)
         context.restoreGState()
     }

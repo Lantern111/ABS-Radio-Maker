@@ -4,6 +4,8 @@ import UniformTypeIdentifiers
 struct ContentView: View {
     @Bindable var studio: Studio
     @AppStorage("sidebarTab") private var tab = SidebarTab.layers
+    @Environment(\.undoManager) private var undoManager
+    @State private var keyCommands = KeyCommands()
 
     var body: some View {
         HSplitView {
@@ -53,6 +55,15 @@ struct ContentView: View {
             }
         }
         .navigationTitle(studio.recordingURL?.lastPathComponent ?? "ABS Radio Maker")
+        .background(WindowReader { keyCommands.window = $0 })
+        .onAppear {
+            keyCommands.install(for: studio)
+            studio.undoManager = undoManager
+        }
+        .onChange(of: undoManager) { studio.undoManager = undoManager }
+        .sheet(isPresented: $studio.showsShortcuts) {
+            ShortcutsSheet()
+        }
         .dropDestination(for: URL.self) { urls, _ in
             guard let url = urls.first(where: { url in
                 UTType(filenameExtension: url.pathExtension)?.conforms(to: .audio) ?? false

@@ -1,87 +1,136 @@
 import SwiftUI
 
-/// Play and pause, the time, zoom, and the timeline of talk and songs.
+/// Play and pause, the time, the editing tools, zoom, and the timeline of talk and songs.
 struct TransportBar: View {
-    let studio: Studio
-    @State private var viewport = TimelineViewport()
+    @Bindable var studio: Studio
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
-                Button {
-                    studio.player.togglePlayback()
-                } label: {
-                    Image(systemName: studio.player.isPlaying ? "pause.fill" : "play.fill")
-                        .frame(width: 20)
-                }
-                .keyboardShortcut(.space, modifiers: [])
-                .disabled(!studio.hasRecording)
-                .help("재생 / 일시정지 (스페이스바)")
+                PlayButton(player: studio.player, isEnabled: studio.hasRecording)
+                PlaybackTime(player: studio.player)
 
-                Text("\(TimeText.format(studio.player.time)) / \(TimeText.format(studio.player.duration))")
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
+                Divider().frame(height: 16)
+
+                Picker("도구", selection: Binding(get: { studio.timeline.tool }, set: { studio.timeline.tool = $0 })) {
+                    Label("선택 (A)", systemImage: "cursorarrow").tag(TimelineTool.select)
+                    Label("자르기 (B)", systemImage: "scissors").tag(TimelineTool.blade)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
+                .help("선택 도구 (A) / 자르기 도구 (B): 자르기 도구로 색 띠를 클릭하면 그 자리에서 구간이 나뉘어요")
+
+                Button("재생 위치에서 자르기", systemImage: "square.split.2x1") {
+                    studio.splitSegment(at: studio.player.time)
+                }
+                .help("재생 위치에서 구간을 둘로 나눠요 (⌘B)")
+                .disabled(!studio.hasRecording)
 
                 Spacer()
 
-                if let selection = viewport.selection {
-                    Text("선택 \(TimeText.format(selection.lowerBound))–\(TimeText.format(selection.upperBound))")
-                        .font(.caption)
-                        .monospacedDigit()
-                        .foregroundStyle(.secondary)
-                    Button("노래로") {
-                        studio.setSegment(from: selection.lowerBound, to: selection.upperBound, isMusic: true)
-                        viewport.selection = nil
-                    }
-                    .tint(Color(nsColor: TimelineNSView.songColor))
-                    Button("말하기로") {
-                        studio.setSegment(from: selection.lowerBound, to: selection.upperBound, isMusic: false)
-                        viewport.selection = nil
-                    }
-                    .tint(Color(nsColor: TimelineNSView.talkColor))
-                    Button("선택 해제", systemImage: "xmark") { viewport.selection = nil }
-                        .labelStyle(.iconOnly)
-                    Divider().frame(height: 16)
-                } else {
-                    Legend(color: Color(nsColor: TimelineNSView.talkColor), label: "말하기")
-                    Legend(color: Color(nsColor: TimelineNSView.songColor), label: "노래")
-                    Divider().frame(height: 16)
-                }
+                SelectionControls(studio: studio)
 
-                Button("축소", systemImage: "minus.magnifyingglass") { viewport.zoom(by: 1 / 1.6) }
-                    .keyboardShortcut("-", modifiers: .command)
+                Divider().frame(height: 16)
+
+                Button("축소", systemImage: "minus.magnifyingglass") { studio.timeline.zoom(by: 1 / 1.6) }
                     .help("타임라인 축소 (⌘−)")
-                    .disabled(!studio.hasRecording || viewport.isShowingAll)
+                    .disabled(!studio.hasRecording || studio.timeline.isShowingAll)
                 Button("확대", systemImage: "plus.magnifyingglass") {
-                    viewport.zoom(by: 1.6, around: studio.player.time)
+                    studio.timeline.zoom(by: 1.6, around: studio.player.time)
                 }
-                .keyboardShortcut("=", modifiers: .command)
-                .help("재생 위치를 중심으로 확대 (⌘+)")
+                .help("재생 위치를 중심으로 확대 (⌘=)")
                 .disabled(!studio.hasRecording)
-                Button("전체", systemImage: "arrow.left.and.right") { viewport.showAll() }
-                    .keyboardShortcut("0", modifiers: .command)
-                    .help("녹음 전체 보기 (⌘0)")
-                    .disabled(!studio.hasRecording || viewport.isShowingAll)
+                Button("전체", systemImage: "arrow.left.and.right") { studio.timeline.showAll() }
+                    .help("녹음 전체 보기 (⇧Z)")
+                    .disabled(!studio.hasRecording || studio.timeline.isShowingAll)
+                Button("단축키", systemImage: "keyboard") { studio.showsShortcuts = true }
+                    .help("키보드 단축키 보기")
             }
             .labelStyle(.iconOnly)
             .buttonStyle(.bordered)
             .controlSize(.small)
 
-            TimelineEditor(studio: studio, viewport: viewport)
+            TimelineEditor(studio: studio)
                 .frame(height: 118)
                 .clipShape(RoundedRectangle(cornerRadius: 6))
                 .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.primary.opacity(0.1)))
 
-            Text("가로로 스크롤해서 이동하고, 핀치하거나 ⌘를 누른 채 스크롤해서 확대해요. 색 띠의 경계를 끌어 옮기고, 띠를 클릭하거나 끌어 선택한 뒤 \"노래로\"·\"말하기로\"를 누르세요. 우클릭으로도 바꿀 수 있어요.")
+            Text(studio.timeline.tool == .blade
+                ? "자르기 도구: 색 띠나 파형을 클릭하면 그 자리에서 구간이 나뉘어요. 나눈 조각을 클릭해 선택하고 1(말하기)이나 2(노래)를 누르세요. A를 누르면 선택 도구로 돌아가요."
+                : "색 띠를 클릭하거나 끌어서 선택하고 1(말하기)·2(노래)를 누르거나 우클릭하세요. 경계는 끌어서 옮겨요. 짧은 멘트는 B(자르기)로 나눠서 지정해요.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                .lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
                 .opacity(studio.hasRecording ? 1 : 0)
         }
         .padding(12)
         .onChange(of: studio.recordingURL) {
-            viewport.showAll()
-            viewport.selection = nil
+            studio.timeline.showAll()
+            studio.timeline.selection = nil
+        }
+    }
+}
+
+/// Reads the playback position on its own, so only this updates 30 times a second while playing.
+private struct PlaybackTime: View {
+    let player: PreviewPlayer
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text("\(TimeText.format(player.time, precise: true)) / \(TimeText.format(player.duration))")
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+            if player.isPlaying, player.rate != 1 {
+                Text("\(Int(player.rate))×")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.orange)
+            }
+        }
+    }
+}
+
+private struct PlayButton: View {
+    let player: PreviewPlayer
+    let isEnabled: Bool
+
+    var body: some View {
+        Button(player.isPlaying ? "일시정지" : "재생", systemImage: player.isPlaying ? "pause.fill" : "play.fill") {
+            player.togglePlayback()
+        }
+        .help("재생 / 일시정지 (스페이스바)")
+        .disabled(!isEnabled)
+    }
+}
+
+/// With a selection: make it talk or a song. Without: the colors' meaning.
+private struct SelectionControls: View {
+    let studio: Studio
+
+    var body: some View {
+        if let selection = studio.timeline.selection {
+            Text("선택 \(TimeText.format(selection.lowerBound, precise: true))–\(TimeText.format(selection.upperBound, precise: true))")
+                .font(.caption)
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+            Button {
+                studio.setSegment(from: selection.lowerBound, to: selection.upperBound, isMusic: false)
+            } label: {
+                Text("말하기로 (1)")
+            }
+            .tint(Color(nsColor: TimelineNSView.talkColor))
+            Button {
+                studio.setSegment(from: selection.lowerBound, to: selection.upperBound, isMusic: true)
+            } label: {
+                Text("노래로 (2)")
+            }
+            .tint(Color(nsColor: TimelineNSView.songColor))
+            Button("선택 해제", systemImage: "xmark") { studio.timeline.selection = nil }
+                .help("선택 해제 (Esc)")
+        } else {
+            Legend(color: Color(nsColor: TimelineNSView.talkColor), label: "말하기")
+            Legend(color: Color(nsColor: TimelineNSView.songColor), label: "노래")
         }
     }
 }

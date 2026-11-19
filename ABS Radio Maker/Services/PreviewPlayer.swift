@@ -7,6 +7,8 @@ import Observation
     private(set) var duration: Double = 0
     /// Where playback is, in seconds. Updated 30 times a second while playing, so anything that shows it moves along.
     private(set) var time: Double = 0
+    /// 1 is normal speed. Pressing L again while playing doubles it, up to the 2 the player allows.
+    private(set) var rate: Float = 1
 
     @ObservationIgnored private var player: AVAudioPlayer?
     @ObservationIgnored private var clock: Timer?
@@ -15,6 +17,7 @@ import Observation
         let keepTime = time
         stop()
         player = try? AVAudioPlayer(contentsOf: url)
+        player?.enableRate = true
         player?.prepareToPlay()
         duration = player?.duration ?? 0
         seek(to: min(keepTime, duration))
@@ -31,9 +34,16 @@ import Observation
         isPlaying ? pause() : play()
     }
 
-    func play() {
+    func play(rate: Float = 1) {
         guard let player else { return }
+        if isPlaying {
+            self.rate = rate
+            player.rate = rate
+            return
+        }
         if time >= duration - 0.05 { time = 0 }
+        self.rate = rate
+        player.rate = rate
         player.currentTime = time
         player.play()
         isPlaying = true
@@ -45,7 +55,13 @@ import Observation
         self.clock = clock
     }
 
+    /// L: plays, or plays faster if already playing.
+    func playFaster() {
+        play(rate: isPlaying ? min(rate * 2, 2) : 1)
+    }
+
     func pause() {
+        rate = 1
         guard isPlaying else { return }
         time = player?.currentTime ?? time
         stop()

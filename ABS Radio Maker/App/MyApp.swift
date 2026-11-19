@@ -29,6 +29,11 @@ import SwiftUI
                     .disabled(studio.isBusy)
             }
 
+            CommandGroup(replacing: .help) {
+                Button("키보드 단축키") { studio.showsShortcuts = true }
+                    .keyboardShortcut("k", modifiers: [.command, .option])
+            }
+
             CommandGroup(after: .saveItem) {
                 Button("영상 내보내기…", action: studio.exportVideo)
                     .keyboardShortcut("e")

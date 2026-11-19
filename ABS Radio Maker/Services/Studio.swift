@@ -20,6 +20,10 @@ import UniformTypeIdentifiers
 
     let layers = LayerLibrary()
     let player = PreviewPlayer()
+    /// What the timeline shows and what's selected in it, shared by the timeline, its buttons, and the keyboard.
+    let timeline = TimelineViewport()
+    /// The window's undo manager, so cutting and changing stretches can be undone with ⌘Z.
+    @ObservationIgnored weak var undoManager: UndoManager?
 
     var settings = StudioSettings.load() {
         didSet {
@@ -46,24 +50,29 @@ import UniformTypeIdentifiers
     private(set) var recordingDuration: Double = 0
     private(set) var processed: ProcessedAudio?
     private(set) var performance: Performance
-    /// Song and talk stretches in the original recording's time.
-    private(set) var sourceSegments: [ContentSegment] = []
+    /// Song and talk stretches in the original recording's time. Neighbors can be the same kind once a stretch has been
+    /// cut in two.
+    private(set) var sourceSegments: [ContentSegment] = [] {
+        didSet { updateTimelineSegments() }
+    }
+    /// The same stretches in the edited audio's time, for the timeline.
+    private(set) var timelineSegments: [ContentSegment] = []
     private(set) var segmentsWereEdited = false
     /// Peak levels for drawing the timeline, from 0 to 1, `peaksPerSecond` of them for each second of edited audio.
     private(set) var peaks: [Float] = []
     nonisolated static let peaksPerSecond = 100.0
     var export: ExportState?
     var errorMessage: String?
+    var showsShortcuts = false
 
-    @ObservationIgnored private var source: AudioClip?
+    @ObservationIgnored private var source: SourceAudio?
     @ObservationIgnored private var detectedSegments: [ContentSegment] = []
     @ObservationIgnored private var classifiedWindows: [ClassifiedWindow] = []
     /// Voice levels for each frame of the edited audio, and the frame rate they were measured at.
     @ObservationIgnored private var voiceLevels: (levels: [Float], framesPerSecond: Int)?
     @ObservationIgnored private var processingTask: Task<Void, Never>?
     @ObservationIgnored private var exportCancel = CancelFlag()
-    @ObservationIgnored private var previewRenderer: FrameRenderer?
-    @ObservationIgnored private var previewRendererRevision = -1
+    @ObservationIgnored private var cachedSceneRenderer: (renderer: FrameRenderer, revision: Int)?
 
     static let audioTypes: [UTType] = [.audio, .wav, .mp3, .mpeg4Audio, .aiff]
 
@@ -97,6 +106,8 @@ import UniformTypeIdentifiers
         processed = nil
         peaks = []
         voiceLevels = nil
+        sourceSegments = []
+        undoManager?.removeAllActions(withTarget: self)
         performance = Performance.idle(framesPerSecond: settings.framesPerSecond)
         recordingURL = url
         recordingDuration = 0
@@ -108,29 +119,34 @@ import UniformTypeIdentifiers
             let accessing = url.startAccessingSecurityScopedResource()
             defer { if accessing { url.stopAccessingSecurityScopedResource() } }
             do {
-                let clip = try await Task.detached(priority: .userInitiated) {
-                    try AudioClip.load(from: url) { fraction in
-                        Task { @MainActor in self?.updateWorking("녹음 파일을 읽는 중…", fraction) }
-                    }
-                }.value
-                try Task.checkCancellation()
-                self?.updateWorking("노래 구간을 찾는 중…", 0)
-                let windows = try await Task.detached(priority: .userInitiated) {
-                    try ContentDetector.classify(clip) { fraction in
-                        Task { @MainActor in self?.updateWorking("노래 구간을 찾는 중…", fraction) }
-                    } isCancelled: {
-                        Task.isCancelled
-                    }
-                }.value
+                let cancel = CancelFlag()
+                // Reading, finding songs, and moving the original to a file happen together, so the decoded
+                // recording is let go of as soon as the file is written.
+                let (windows, source) = try await withTaskCancellationHandler {
+                    try await Task.detached(priority: .userInitiated) {
+                        let clip = try AudioClip.load(from: url) { fraction in
+                            Task { @MainActor in self?.updateWorking("녹음 파일을 읽는 중…", fraction) }
+                        }
+                        if cancel.isSet { throw CancellationError() }
+                        let windows = try ContentDetector.classify(clip) { fraction in
+                            Task { @MainActor in self?.updateWorking("노래 구간을 찾는 중…", fraction) }
+                        } isCancelled: {
+                            cancel.isSet
+                        }
+                        return (windows, try SourceAudio(clip))
+                    }.value
+                } onCancel: {
+                    cancel.set()
+                }
                 try Task.checkCancellation()
                 guard let self else { return }
-                source = clip
+                self.source = source
                 classifiedWindows = windows
-                recordingDuration = clip.duration
-                detectedSegments = ContentDetector.segments(from: windows, duration: clip.duration)
+                recordingDuration = source.duration
+                detectedSegments = ContentDetector.segments(from: windows, duration: source.duration)
                 sourceSegments = detectedSegments
                 segmentsWereEdited = false
-                await process(clip)
+                await process(source)
             } catch is CancellationError {
                 return
             } catch {
@@ -162,14 +178,14 @@ import UniformTypeIdentifiers
         }
     }
 
-    private func process(_ clip: AudioClip) async {
+    private func process(_ source: SourceAudio) async {
         phase = .working(message: "소리를 다듬는 중…", fraction: nil)
         let options = audioOptions
         let fps = settings.framesPerSecond
         let previewURL = FileManager.default.temporaryDirectory.appending(path: "preview-\(UUID().uuidString).wav")
         do {
             let result = try await Task.detached(priority: .userInitiated) {
-                let processed = AudioProcessor.process(clip, options: options)
+                let processed = AudioProcessor.process(source, options: options)
                 try Task.checkCancellation()
                 try processed.clip.write(
                     to: previewURL,
@@ -182,6 +198,7 @@ import UniformTypeIdentifiers
             processed = result.0
             peaks = result.1
             voiceLevels = (result.2, fps)
+            updateTimelineSegments()
             await buildPerformance()
             player.load(previewURL)
             if let oldPreview { player.seek(to: oldPreview) }
@@ -235,8 +252,26 @@ import UniformTypeIdentifiers
 
     // MARK: - Songs and talk
 
-    /// Makes everything from `start` to `end` of the edited audio a song, or talk. For when the automatic guess got it
-    /// wrong.
+    private func updateTimelineSegments() {
+        guard let processed else {
+            timelineSegments = []
+            return
+        }
+        let map = processed.timeMap
+        let duration = map.outputDuration
+        timelineSegments = sourceSegments.compactMap { segment in
+            let start = max(map.outputTime(atSource: segment.start), 0)
+            let end = min(map.outputTime(atSource: segment.end), duration)
+            return end - start > 0.01 ? ContentSegment(start: start, end: end, isMusic: segment.isMusic) : nil
+        }
+    }
+
+    /// Where one stretch meets the next, in the edited audio's time.
+    var segmentBorders: [Double] {
+        timelineSegments.dropFirst().map(\.start)
+    }
+
+    /// Makes everything from `start` to `end` of the edited audio a song, or talk.
     func setSegment(from start: Double, to end: Double, isMusic: Bool) {
         guard let processed, end > start else { return }
         let sourceStart = processed.timeMap.sourceTime(at: start)
@@ -257,7 +292,44 @@ import UniformTypeIdentifiers
             }
         }
         edited.append(ContentSegment(start: sourceStart, end: sourceEnd, isMusic: isMusic))
-        commitSegments(edited)
+        commitSegments(edited, actionName: isMusic ? "노래로 바꾸기" : "말하기로 바꾸기")
+    }
+
+    /// Changes the stretch under a moment of the edited audio, keeping its borders.
+    func setSegment(at time: Double, isMusic: Bool) {
+        guard let segment = timelineSegment(at: time) else { return }
+        setSegment(from: segment.start, to: segment.end, isMusic: isMusic)
+    }
+
+    func timelineSegment(at time: Double) -> ContentSegment? {
+        timelineSegments.first { $0.start <= time && time < $0.end } ?? timelineSegments.last
+    }
+
+    /// Cuts the stretch under a moment of the edited audio in two, so each half can be made a song or talk.
+    func splitSegment(at time: Double) {
+        guard let processed else { return }
+        let cut = processed.timeMap.sourceTime(at: time)
+        guard let index = sourceSegments.firstIndex(where: { $0.start < cut && cut < $0.end }) else { return }
+        let segment = sourceSegments[index]
+        // Too close to an existing border to be worth a stretch of its own.
+        guard cut - segment.start > 0.2, segment.end - cut > 0.2 else { return }
+        var edited = sourceSegments
+        edited[index].end = cut
+        edited.insert(ContentSegment(start: cut, end: segment.end, isMusic: segment.isMusic), at: index + 1)
+        commitSegments(edited, actionName: "구간 자르기")
+    }
+
+    /// Removes the border nearest a moment of the edited audio. The stretch before it takes over the one after.
+    func removeBorder(near time: Double) {
+        guard let processed, sourceSegments.count > 1 else { return }
+        let target = processed.timeMap.sourceTime(at: time)
+        guard let index = (1..<sourceSegments.count).min(by: {
+            abs(sourceSegments[$0].start - target) < abs(sourceSegments[$1].start - target)
+        }) else { return }
+        var edited = sourceSegments
+        edited[index - 1].end = edited[index].end
+        edited.remove(at: index)
+        commitSegments(edited, actionName: "경계 지우기")
     }
 
     /// Moves the border between two stretches that's at `from` in the edited audio to `to`.
@@ -269,34 +341,64 @@ import UniformTypeIdentifiers
         guard let index = (1..<sourceSegments.count).min(by: {
             abs(sourceSegments[$0].start - old) < abs(sourceSegments[$1].start - old)
         }) else { return }
-        let lowest = sourceSegments[index - 1].start + 0.5
-        let highest = sourceSegments[index].end - 0.5
+        let lowest = sourceSegments[index - 1].start + 0.2
+        let highest = sourceSegments[index].end - 0.2
         guard highest > lowest else { return }
         let time = min(max(new, lowest), highest)
         var edited = sourceSegments
         edited[index - 1].end = time
         edited[index].start = time
-        commitSegments(edited)
+        commitSegments(edited, actionName: "경계 옮기기")
     }
 
     func restoreDetectedSegments() {
-        sourceSegments = detectedSegments
-        segmentsWereEdited = false
+        commitSegments(detectedSegments, actionName: "자동으로 찾은 대로 되돌리기", edited: false)
+    }
+
+    /// Puts in new stretches, in a way ⌘Z can take back.
+    private func commitSegments(_ segments: [ContentSegment], actionName: String, edited: Bool = true) {
+        let cleaned = segments.sorted { $0.start < $1.start }.filter { $0.end > $0.start }
+        replaceSegments(with: cleaned, edited: edited, actionName: actionName)
+    }
+
+    private func replaceSegments(with segments: [ContentSegment], edited: Bool, actionName: String) {
+        let previous = sourceSegments
+        let previousEdited = segmentsWereEdited
+        undoManager?.registerUndo(withTarget: self) { studio in
+            MainActor.assumeIsolated {
+                studio.replaceSegments(with: previous, edited: previousEdited, actionName: actionName)
+            }
+        }
+        undoManager?.setActionName(actionName)
+        sourceSegments = segments
+        segmentsWereEdited = edited
+        timeline.selection = nil
         rebuildPerformance()
     }
 
-    private func commitSegments(_ segments: [ContentSegment]) {
-        var merged = [ContentSegment]()
-        for segment in segments.sorted(by: { $0.start < $1.start }) where segment.end > segment.start {
-            if let last = merged.last, last.isMusic == segment.isMusic {
-                merged[merged.count - 1].end = max(last.end, segment.end)
-            } else {
-                merged.append(segment)
-            }
+    // MARK: - Moving around
+
+    var framesPerSecond: Double { Double(settings.framesPerSecond) }
+
+    func step(frames: Int) {
+        player.seek(to: player.time + Double(frames) / framesPerSecond)
+        timeline.reveal(player.time)
+    }
+
+    /// Jumps to the next or previous border between stretches, or to the start or end.
+    func jumpToBorder(forward: Bool) {
+        let now = player.time
+        let stops = [0] + segmentBorders + [player.duration]
+        let target = forward ? stops.first { $0 > now + 0.01 } : stops.last { $0 < now - 0.01 }
+        if let target {
+            player.seek(to: target)
+            timeline.reveal(target)
         }
-        sourceSegments = merged
-        segmentsWereEdited = true
-        rebuildPerformance()
+    }
+
+    func jump(to time: Double) {
+        player.seek(to: time)
+        timeline.reveal(player.time)
     }
 
     // MARK: - Performance
@@ -335,22 +437,25 @@ import UniformTypeIdentifiers
         performance = built
     }
 
-    // MARK: - Preview picture
+    // MARK: - Preview
 
-    static let previewSize = CGSize(width: 960, height: 540)
-
-    /// The picture at a moment in the preview. Without a recording, the character idles on a loop.
-    func previewImage(at time: Double) -> CGImage? {
-        if previewRenderer == nil || previewRendererRevision != layers.revision {
-            previewRenderer = FrameRenderer(images: layers.images, size: Self.previewSize)
-            previewRendererRevision = layers.revision
+    /// The layer pictures prepared at the video's size, for the preview. Remade when a picture changes.
+    var sceneRenderer: FrameRenderer {
+        if let cached = cachedSceneRenderer, cached.revision == layers.revision {
+            return cached.renderer
         }
+        let renderer = FrameRenderer(images: layers.images, size: VideoExporter.size)
+        cachedSceneRenderer = (renderer, layers.revision)
+        return renderer
+    }
+
+    /// What the character does at a moment. Without a recording, the character idles on a loop.
+    func pose(at time: Double) -> Performance.Pose {
         var frame = Int(time * Double(performance.framesPerSecond))
         if !hasRecording, performance.frameCount > 0 {
             frame %= performance.frameCount
         }
-        let pose = performance.pose(at: frame, swayAmount: settings.swayAmount)
-        return previewRenderer?.makeImage(pose: pose, settings: settings)
+        return performance.pose(at: frame, swayAmount: settings.swayAmount)
     }
 
     // MARK: - Exporting
