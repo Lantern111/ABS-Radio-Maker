@@ -5,8 +5,6 @@ struct AudioPanel: View {
     @Bindable var studio: Studio
 
     var body: some View {
-        // Read so the song button's wording follows the playback position.
-        let _ = (studio.player.seekRevision, studio.player.isPlaying)
         Form {
             Section {
                 LabeledContent("시작", value: TimeText.format(studio.audioOptions.trimStart))
@@ -51,14 +49,16 @@ struct AudioPanel: View {
             }
 
             Section {
-                Button(studio.isSongAtPlayhead ? "이 구간은 말하기예요" : "이 구간은 노래예요", action: studio.flipSegmentAtPlayhead)
                 if studio.segmentsWereEdited {
                     Button("자동으로 찾은 대로 되돌리기", action: studio.restoreDetectedSegments)
+                } else {
+                    Text("자동으로 찾은 그대로예요.")
+                        .foregroundStyle(.secondary)
                 }
             } header: {
                 Text("노래 구간")
             } footer: {
-                Text("노래가 나오면 캐릭터가 눈을 감고 음악을 들어요. 자동으로 찾은 구간이 틀렸다면 타임라인에서 그 구간으로 옮긴 뒤 위 버튼을 누르세요.")
+                Text("아래 타임라인의 색 띠에서 직접 고쳐요. 경계를 끌어 옮기거나, 띠를 클릭하거나 끌어서 선택한 뒤 \"노래로\"·\"말하기로\"를 누르세요.")
             }
             .disabled(!studio.hasRecording)
         }

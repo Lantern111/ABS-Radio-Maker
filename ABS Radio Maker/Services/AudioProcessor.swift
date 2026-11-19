@@ -116,6 +116,14 @@ enum AudioProcessor {
         return [(1 + cosine) / 2 / a0, -(1 + cosine) / a0, (1 + cosine) / 2 / a0, -2 * cosine / a0, (1 - alpha) / a0]
     }
 
+    static func lowPassCoefficients(frequency: Double, q: Double, sampleRate: Double) -> Biquad {
+        let omega = 2 * Double.pi * frequency / sampleRate
+        let alpha = sin(omega) / (2 * q)
+        let cosine = cos(omega)
+        let a0 = 1 + alpha
+        return [(1 - cosine) / 2 / a0, (1 - cosine) / a0, (1 - cosine) / 2 / a0, -2 * cosine / a0, (1 - alpha) / a0]
+    }
+
     /// Runs the samples through the filter sections in place, a piece at a time so it needs little extra memory.
     static func filter(_ samples: inout [Float], sections: [Biquad]) {
         guard let setup = vDSP_biquad_CreateSetup(sections.flatMap { $0 }, vDSP_Length(sections.count)) else { return }

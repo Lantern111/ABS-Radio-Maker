@@ -8,24 +8,30 @@ struct PreviewArea: View {
         ZStack {
             Color.black
 
-            // Without a recording the character idles on a loop, so layers can be arranged before anything is open.
-            TimelineView(.animation(minimumInterval: 1.0 / 30, paused: studio.hasRecording && !studio.player.isPlaying)) { context in
-                let time = studio.hasRecording
-                    ? studio.player.currentTime
-                    : context.date.timeIntervalSinceReferenceDate
-                // Read so a paused preview redraws when the position, layers, or settings change.
-                let _ = (studio.player.seekRevision, studio.layers.revision, studio.settings, studio.performance.frameCount)
-                if let image = studio.previewImage(at: time) {
-                    Image(decorative: image, scale: 1)
-                        .resizable()
-                        .interpolation(.high)
-                        .aspectRatio(16 / 9, contentMode: .fit)
+            if studio.hasRecording {
+                // Follows the player's position, which updates 30 times a second while playing.
+                scene(at: studio.player.time)
+            } else {
+                // Without a recording the character idles on a loop, so layers can be arranged before anything is open.
+                TimelineView(.animation(minimumInterval: 1.0 / 30)) { context in
+                    scene(at: context.date.timeIntervalSinceReferenceDate)
                 }
             }
 
             overlay
         }
         .frame(minHeight: 340)
+    }
+
+    @ViewBuilder private func scene(at time: Double) -> some View {
+        // Read so the picture redraws when the layers, settings, or what the character does change.
+        let _ = (studio.layers.revision, studio.settings)
+        if let image = studio.previewImage(at: time) {
+            Image(decorative: image, scale: 1)
+                .resizable()
+                .interpolation(.high)
+                .aspectRatio(16 / 9, contentMode: .fit)
+        }
     }
 
     @ViewBuilder private var overlay: some View {

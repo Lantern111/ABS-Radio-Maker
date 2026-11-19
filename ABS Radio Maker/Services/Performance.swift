@@ -12,6 +12,8 @@ struct Performance: Sendable {
     /// How far into the listening pose, from 0 to 1. Eases over half a second when a song starts or stops.
     var listening: [Float]
     var blinking: [Bool]
+    /// While listening, whether the eyes are shut to enjoy the song.
+    var eyesClosed: [Bool]
     /// Talk and song stretches in the edited audio's time, for the timeline.
     var segments: [ContentSegment]
 
@@ -27,26 +29,35 @@ struct Performance: Sendable {
             energy: Array(repeating: 0, count: count),
             listening: Array(repeating: 0, count: count),
             blinking: blinks(count: count, framesPerSecond: framesPerSecond),
+            eyesClosed: Array(repeating: false, count: count),
             segments: [ContentSegment(start: 0, end: seconds, isMusic: false)]
         )
     }
 
+    /// - Parameters:
+    ///   - voiceLevels: From `voiceLevels(_:framesPerSecond:)`, at the same frame rate.
+    ///   - sourceSegments: Talk and songs, in the original recording's time.
+    ///   - speechWindows: The classifier's results, in the original recording's time, so the mouth stays shut where
+    ///     nobody is talking even though something else is playing.
     static func make(
         audio: ProcessedAudio,
+        voiceLevels levels: [Float],
         sourceSegments: [ContentSegment],
+        speechWindows: [ClassifiedWindow],
         framesPerSecond: Int,
-        mouthSensitivity: Double
+        mouthSensitivity: Double,
+        listeningEyes: ListeningEyes
     ) -> Performance {
-        let clip = audio.clip
         let fps = Double(framesPerSecond)
-        let count = max(1, Int((clip.duration * fps).rounded(.up)))
+        let count = max(1, levels.count)
+        let sourceTimes = (0..<count).map { audio.timeMap.sourceTime(at: (Double($0) + 0.5) / fps) }
 
         // Song or talk for each frame, looked up in the original recording's time.
         var isMusic = [Bool](repeating: false, count: count)
         if !sourceSegments.isEmpty {
             var segmentIndex = 0
             for frame in 0..<count {
-                let time = audio.timeMap.sourceTime(at: (Double(frame) + 0.5) / fps)
+                let time = sourceTimes[frame]
                 // Times only move forward, except for a jump back at a shortened pause, which is rare enough to search.
                 if time < sourceSegments[segmentIndex].start { segmentIndex = 0 }
                 while segmentIndex < sourceSegments.count - 1, sourceSegments[segmentIndex].end <= time { segmentIndex += 1 }
@@ -54,26 +65,27 @@ struct Performance: Sendable {
             }
         }
 
-        let levels = frameLevels(clip, frameCount: count, framesPerSecond: fps)
-        let talkLevels = zip(levels, isMusic).filter { !$0.1 }.map(\.0).sorted()
-        func percentile(_ fraction: Double) -> Float {
-            talkLevels.isEmpty ? -40 : talkLevels[Int(Double(talkLevels.count - 1) * min(max(fraction, 0), 1))]
-        }
-        // Thresholds come from this recording's own talk, so a quiet or heavily compressed recording still gets about
-        // the same mix of shut, half-open, and wide-open frames.
-        let halfQuantile = 0.45 - 0.3 * mouthSensitivity
-        let halfOpen = percentile(halfQuantile)
-        let wideOpen = max(percentile(halfQuantile + 0.32), halfOpen + 3)
-        let floor = percentile(0.2)
-        let peak = max(percentile(0.97), floor + 6)
+        // The mouth follows the voice compared with the last moment or so, not with the whole show, so background music
+        // under the talking doesn't hold it open: each syllable rises above the music bed for a moment, then drops back.
+        let reach = max(1, Int(0.6 * fps))
+        let localLow = slidingExtreme(levels, reach: reach, lowest: true)
+        let localHigh = slidingExtreme(levels, reach: reach, lowest: false)
+        let halfOpen = Float(0.6 - 0.3 * mouthSensitivity)
+        let wideOpen = halfOpen + 0.35
 
         var mouth = [UInt8](repeating: 0, count: count)
         var energy = [Float](repeating: 0, count: count)
         var smoothedEnergy: Float = 0
-        for frame in 0..<count where !isMusic[frame] {
-            mouth[frame] = levels[frame] >= wideOpen ? 2 : levels[frame] >= halfOpen ? 1 : 0
-            let level = min(max((levels[frame] - floor) / (peak - floor), 0), 1)
-            smoothedEnergy += (level - smoothedEnergy) * (level > smoothedEnergy ? 0.5 : 0.08)
+        for frame in 0..<count where levels.indices.contains(frame) && !isMusic[frame] {
+            let range = localHigh[frame] - localLow[frame]
+            let level = range < 8 ? 0 : (levels[frame] - localLow[frame]) / range
+            let someoneIsTalking = speechWindows.isEmpty
+                || ContentDetector.speech(at: sourceTimes[frame], in: speechWindows) >= 0.3
+            if someoneIsTalking {
+                mouth[frame] = level >= wideOpen ? 2 : level >= halfOpen ? 1 : 0
+            }
+            let target: Float = someoneIsTalking ? level : 0
+            smoothedEnergy += (target - smoothedEnergy) * (target > smoothedEnergy ? 0.5 : 0.08)
             energy[frame] = smoothedEnergy
         }
         // Lips pass through half open on the way from wide open to shut, and a single shut frame in the middle of
@@ -108,26 +120,55 @@ struct Performance: Sendable {
             energy: energy,
             listening: listening,
             blinking: blinks(count: count, framesPerSecond: framesPerSecond),
+            eyesClosed: eyesClosed(isMusic: isMusic, framesPerSecond: framesPerSecond, style: listeningEyes),
             segments: segments
         )
     }
 
-    /// The loudest channel's level in each frame, in dB.
-    static func frameLevels(_ clip: AudioClip, frameCount: Int, framesPerSecond: Double) -> [Float] {
+    /// How loud the voice band (300 to 3,400 Hz) is in each frame, in dB. Bass and cymbals from music matter less here.
+    static func voiceLevels(_ clip: AudioClip, framesPerSecond: Int) -> [Float] {
+        let fps = Double(framesPerSecond)
+        let frameCount = max(1, Int((clip.duration * fps).rounded(.up)))
+        let sections = [
+            AudioProcessor.highPassCoefficients(frequency: 300, q: 0.7071, sampleRate: clip.sampleRate),
+            AudioProcessor.lowPassCoefficients(frequency: 3400, q: 0.7071, sampleRate: clip.sampleRate),
+        ]
+        guard let setup = vDSP_biquad_CreateSetup(sections.flatMap { $0 }, vDSP_Length(sections.count)) else {
+            return Array(repeating: -120, count: frameCount)
+        }
+        defer { vDSP_biquad_DestroySetup(setup) }
+        var delay = [Float](repeating: 0, count: 2 * sections.count + 2)
+
+        let longest = Int((clip.sampleRate / fps).rounded(.up)) + 1
+        var mixed = [Float](repeating: 0, count: longest)
+        var filtered = [Float](repeating: 0, count: longest)
+        var scale = 1 / Float(max(clip.channels.count, 1))
         var levels = [Float](repeating: -120, count: frameCount)
-        for channel in clip.channels {
-            channel.withUnsafeBufferPointer { samples in
-                for frame in 0..<frameCount {
-                    let start = Int(Double(frame) / framesPerSecond * clip.sampleRate)
-                    let end = min(Int(Double(frame + 1) / framesPerSecond * clip.sampleRate), samples.count)
-                    guard end > start else { continue }
-                    var meanSquare: Float = 0
-                    vDSP_measqv(samples.baseAddress! + start, 1, &meanSquare, vDSP_Length(end - start))
-                    levels[frame] = max(levels[frame], 10 * log10(max(meanSquare, 1e-12)))
+        for frame in 0..<frameCount {
+            let start = Int(Double(frame) / fps * clip.sampleRate)
+            let end = min(Int(Double(frame + 1) / fps * clip.sampleRate), clip.frameCount)
+            let length = min(end - start, longest)
+            guard length > 0 else { continue }
+            vDSP_vclr(&mixed, 1, vDSP_Length(length))
+            for channel in clip.channels {
+                channel.withUnsafeBufferPointer { samples in
+                    vDSP_vsma(samples.baseAddress! + start, 1, &scale, mixed, 1, &mixed, 1, vDSP_Length(length))
                 }
             }
+            vDSP_biquad(setup, &delay, mixed, 1, &filtered, 1, vDSP_Length(length))
+            var meanSquare: Float = 0
+            vDSP_measqv(filtered, 1, &meanSquare, vDSP_Length(length))
+            levels[frame] = 10 * log10(max(meanSquare, 1e-12))
         }
         return levels
+    }
+
+    /// The lowest or highest value within `reach` of each position.
+    static func slidingExtreme(_ values: [Float], reach: Int, lowest: Bool) -> [Float] {
+        values.indices.map { index in
+            let neighbors = values[max(0, index - reach)...min(values.count - 1, index + reach)]
+            return (lowest ? neighbors.min() : neighbors.max()) ?? values[index]
+        }
     }
 
     /// Blinks every 2.5 to 6 seconds, each about an eighth of a second. The same every time, so a re-export matches.
@@ -144,6 +185,36 @@ struct Performance: Sendable {
         return blinking
     }
 
+    /// During songs, stretches with the eyes shut, between stretches of listening with them open.
+    static func eyesClosed(isMusic: [Bool], framesPerSecond: Int, style: ListeningEyes) -> [Bool] {
+        var closed = [Bool](repeating: false, count: isMusic.count)
+        guard style != .open else { return closed }
+        var generator = SeededGenerator(seed: 0x50A6)
+        let fps = Double(framesPerSecond)
+        var frame = 0
+        while frame < isMusic.count {
+            guard isMusic[frame] else {
+                frame += 1
+                continue
+            }
+            var songEnd = frame
+            while songEnd < isMusic.count, isMusic[songEnd] { songEnd += 1 }
+            if style == .always {
+                for index in frame..<songEnd { closed[index] = true }
+            } else {
+                // Each song starts with the eyes open, then alternates.
+                var position = frame + Int(Double.random(in: style.openSeconds, using: &generator) * fps)
+                while position < songEnd {
+                    let shut = Int(Double.random(in: style.closedSeconds, using: &generator) * fps)
+                    for index in position..<min(position + shut, songEnd) { closed[index] = true }
+                    position += shut + Int(Double.random(in: style.openSeconds, using: &generator) * fps)
+                }
+            }
+            frame = songEnd
+        }
+        return closed
+    }
+
     // MARK: - One frame
 
     struct Pose: Sendable {
@@ -158,8 +229,9 @@ struct Performance: Sendable {
     func pose(at frame: Int, swayAmount: Double) -> Pose {
         let frame = min(max(frame, 0), max(frameCount - 1, 0))
         let time = Double(frame) / Double(framesPerSecond)
-        let energy = Double(frameCount > 0 ? self.energy[frame] : 0)
-        let listening = Double(frameCount > 0 ? self.listening[frame] : 0)
+        let hasFrames = frameCount > 0
+        let energy = Double(hasFrames ? self.energy[frame] : 0)
+        let listening = Double(hasFrames ? self.listening[frame] : 0)
         let degree = Double.pi / 180
         let sway = swayAmount
 
@@ -174,11 +246,15 @@ struct Performance: Sendable {
 
         let drawing: LayerSlot
         if listening > 0.5 {
-            drawing = .listening
-        } else if frameCount > 0, blinking[frame] {
+            if hasFrames, eyesClosed[frame] {
+                drawing = .listening
+            } else {
+                drawing = hasFrames && blinking[frame] ? .blink : .character
+            }
+        } else if hasFrames, blinking[frame] {
             drawing = .blink
         } else {
-            switch frameCount > 0 ? mouth[frame] : 0 {
+            switch hasFrames ? mouth[frame] : 0 {
             case 2: drawing = .mouthOpen
             case 1: drawing = .mouthHalf
             default: drawing = .character

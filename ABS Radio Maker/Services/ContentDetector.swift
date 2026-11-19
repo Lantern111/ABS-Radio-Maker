@@ -65,14 +65,18 @@ enum ContentDetector {
         }
 
         // A song: music or singing with nobody talking. While a vocal is loud the classifier's music score can drop low,
-        // but its speech score stays near zero, so speech is what tells talk from song. A DJ talking over a song's
-        // intro counts as talk, because that's when the mouth should move.
-        var isMusic = windows.map { window in
-            window.speech < 0.5 && max(window.music, window.singing) >= 0.4
+        // but its speech score stays near zero, so speech is what tells talk from song.
+        //
+        // Talking over background music only scores about 0.2 to 0.5 for speech in any one window, against under 0.15
+        // for a song, so the score is averaged over about seven seconds first. A DJ talking over BGM or over a song's
+        // intro or ending counts as talk, because that's when the mouth should move.
+        let reach = 3
+        let speech = averaged(windows.map(\.speech), reach: reach)
+        var isMusic = windows.indices.map { index in
+            speech[index] < 0.25 && max(windows[index].music, windows[index].singing) >= 0.4
         }
 
         // Majority vote over about seven seconds smooths out single odd windows.
-        let reach = 3
         isMusic = isMusic.indices.map { index in
             let neighbors = isMusic[max(0, index - reach)...min(isMusic.count - 1, index + reach)]
             return neighbors.filter { $0 }.count * 2 > neighbors.count
@@ -94,6 +98,28 @@ enum ContentDetector {
         segments = merging(segments) { $0.isMusic && $0.end - $0.start < 20 }
         segments = merging(segments) { !$0.isMusic && $0.end - $0.start < 4 }
         return segments
+    }
+
+    /// Each value replaced by the average of itself and its neighbors within `reach`.
+    static func averaged(_ values: [Double], reach: Int) -> [Double] {
+        values.indices.map { index in
+            let neighbors = values[max(0, index - reach)...min(values.count - 1, index + reach)]
+            return neighbors.reduce(0, +) / Double(neighbors.count)
+        }
+    }
+
+    /// How sure the classifier is that someone is talking at a moment, averaged over a few seconds. The windows must be
+    /// sorted by time.
+    static func speech(at time: Double, in windows: [ClassifiedWindow]) -> Double {
+        guard !windows.isEmpty else { return 1 }
+        var low = 0
+        var high = windows.count - 1
+        while low < high {
+            let middle = (low + high) / 2
+            if windows[middle].time < time { low = middle + 1 } else { high = middle }
+        }
+        let neighbors = windows[max(0, low - 1)...min(windows.count - 1, low + 1)]
+        return neighbors.reduce(0) { $0 + $1.speech } / Double(neighbors.count)
     }
 
     /// Flips each segment the rule picks to the other kind, and joins neighbors of the same kind.

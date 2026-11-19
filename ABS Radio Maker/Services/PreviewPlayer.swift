@@ -1,26 +1,18 @@
 import AVFoundation
 import Observation
 
-/// Plays the edited sound for the preview. The picture follows `currentTime`.
+/// Plays the edited sound for the preview. The picture and the timeline follow `time`.
 @MainActor @Observable final class PreviewPlayer {
     private(set) var isPlaying = false
     private(set) var duration: Double = 0
+    /// Where playback is, in seconds. Updated 30 times a second while playing, so anything that shows it moves along.
+    private(set) var time: Double = 0
 
     @ObservationIgnored private var player: AVAudioPlayer?
-    /// Where playback is while paused, so scrubbing works before anything is loaded.
-    @ObservationIgnored private var pausedTime: Double = 0
-    @ObservationIgnored private var endObserver: Timer?
-
-    /// Changes whenever the position jumps, so a paused preview redraws.
-    private(set) var seekRevision = 0
-
-    var currentTime: Double {
-        if let player, isPlaying { return player.currentTime }
-        return pausedTime
-    }
+    @ObservationIgnored private var clock: Timer?
 
     func load(_ url: URL) {
-        let keepTime = currentTime
+        let keepTime = time
         stop()
         player = try? AVAudioPlayer(contentsOf: url)
         player?.prepareToPlay()
@@ -32,8 +24,7 @@ import Observation
         stop()
         player = nil
         duration = 0
-        pausedTime = 0
-        seekRevision += 1
+        time = 0
     }
 
     func togglePlayback() {
@@ -42,37 +33,44 @@ import Observation
 
     func play() {
         guard let player else { return }
-        if pausedTime >= duration - 0.05 { pausedTime = 0 }
-        player.currentTime = pausedTime
+        if time >= duration - 0.05 { time = 0 }
+        player.currentTime = time
         player.play()
         isPlaying = true
-        // AVAudioPlayer's delegate is an Objective-C protocol; checking now and then is simpler.
-        endObserver = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated {
-                guard let self, let player = self.player, self.isPlaying, !player.isPlaying else { return }
-                self.pausedTime = self.duration
-                self.stop()
-            }
+        let clock = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.tick() }
         }
+        // The common mode keeps it running while a slider or the timeline is being dragged.
+        RunLoop.main.add(clock, forMode: .common)
+        self.clock = clock
     }
 
     func pause() {
         guard isPlaying else { return }
-        pausedTime = player?.currentTime ?? pausedTime
+        time = player?.currentTime ?? time
         stop()
     }
 
-    func seek(to time: Double) {
-        pausedTime = min(max(time, 0), duration)
-        player?.currentTime = pausedTime
-        seekRevision += 1
+    func seek(to newTime: Double) {
+        time = min(max(newTime, 0), duration)
+        player?.currentTime = time
+    }
+
+    private func tick() {
+        guard let player, isPlaying else { return }
+        if player.isPlaying {
+            time = player.currentTime
+        } else {
+            // Reached the end.
+            time = duration
+            stop()
+        }
     }
 
     private func stop() {
         player?.pause()
         isPlaying = false
-        endObserver?.invalidate()
-        endObserver = nil
-        seekRevision += 1
+        clock?.invalidate()
+        clock = nil
     }
 }

@@ -25,7 +25,9 @@ import UniformTypeIdentifiers
         didSet {
             guard settings != oldValue else { return }
             settings.save()
-            if settings.framesPerSecond != oldValue.framesPerSecond || settings.mouthSensitivity != oldValue.mouthSensitivity {
+            if settings.framesPerSecond != oldValue.framesPerSecond
+                || settings.mouthSensitivity != oldValue.mouthSensitivity
+                || settings.listeningEyes != oldValue.listeningEyes {
                 rebuildPerformance()
             }
         }
@@ -47,13 +49,17 @@ import UniformTypeIdentifiers
     /// Song and talk stretches in the original recording's time.
     private(set) var sourceSegments: [ContentSegment] = []
     private(set) var segmentsWereEdited = false
-    /// Peak levels for drawing the timeline, from 0 to 1.
-    private(set) var overview: [Float] = []
+    /// Peak levels for drawing the timeline, from 0 to 1, `peaksPerSecond` of them for each second of edited audio.
+    private(set) var peaks: [Float] = []
+    nonisolated static let peaksPerSecond = 100.0
     var export: ExportState?
     var errorMessage: String?
 
     @ObservationIgnored private var source: AudioClip?
     @ObservationIgnored private var detectedSegments: [ContentSegment] = []
+    @ObservationIgnored private var classifiedWindows: [ClassifiedWindow] = []
+    /// Voice levels for each frame of the edited audio, and the frame rate they were measured at.
+    @ObservationIgnored private var voiceLevels: (levels: [Float], framesPerSecond: Int)?
     @ObservationIgnored private var processingTask: Task<Void, Never>?
     @ObservationIgnored private var exportCancel = CancelFlag()
     @ObservationIgnored private var previewRenderer: FrameRenderer?
@@ -89,7 +95,8 @@ import UniformTypeIdentifiers
         // Cleared first, so resetting the trim below doesn't start processing the previous recording.
         source = nil
         processed = nil
-        overview = []
+        peaks = []
+        voiceLevels = nil
         performance = Performance.idle(framesPerSecond: settings.framesPerSecond)
         recordingURL = url
         recordingDuration = 0
@@ -118,6 +125,7 @@ import UniformTypeIdentifiers
                 try Task.checkCancellation()
                 guard let self else { return }
                 source = clip
+                classifiedWindows = windows
                 recordingDuration = clip.duration
                 detectedSegments = ContentDetector.segments(from: windows, duration: clip.duration)
                 sourceSegments = detectedSegments
@@ -157,6 +165,7 @@ import UniformTypeIdentifiers
     private func process(_ clip: AudioClip) async {
         phase = .working(message: "소리를 다듬는 중…", fraction: nil)
         let options = audioOptions
+        let fps = settings.framesPerSecond
         let previewURL = FileManager.default.temporaryDirectory.appending(path: "preview-\(UUID().uuidString).wav")
         do {
             let result = try await Task.detached(priority: .userInitiated) {
@@ -166,12 +175,13 @@ import UniformTypeIdentifiers
                     to: previewURL,
                     settings: AudioClip.wavSettings(sampleRate: processed.clip.sampleRate, channels: processed.clip.channels.count)
                 )
-                return (processed, Self.makeOverview(processed.clip))
+                return (processed, Self.makePeaks(processed.clip), Performance.voiceLevels(processed.clip, framesPerSecond: fps))
             }.value
             try Task.checkCancellation()
-            let oldPreview = processed == nil ? nil : player.currentTime
+            let oldPreview = processed == nil ? nil : player.time
             processed = result.0
-            overview = result.1
+            peaks = result.1
+            voiceLevels = (result.2, fps)
             await buildPerformance()
             player.load(previewURL)
             if let oldPreview { player.seek(to: oldPreview) }
@@ -185,10 +195,10 @@ import UniformTypeIdentifiers
         }
     }
 
-    nonisolated private static func makeOverview(_ clip: AudioClip) -> [Float] {
-        let count = 800
+    nonisolated private static func makePeaks(_ clip: AudioClip) -> [Float] {
         guard clip.frameCount > 0 else { return [] }
-        let step = max(1, clip.frameCount / count)
+        let step = max(1, Int(clip.sampleRate / peaksPerSecond))
+        let count = (clip.frameCount + step - 1) / step
         var peaks = [Float](repeating: 0, count: count)
         // Straight from each channel: a mono copy of a whole show would be hundreds of megabytes.
         for channel in clip.channels {
@@ -208,14 +218,14 @@ import UniformTypeIdentifiers
     /// Trims the recording so it starts at the preview's current position.
     func startHere() {
         guard let processed else { return }
-        audioOptions.trimStart = processed.timeMap.sourceTime(at: player.currentTime)
+        audioOptions.trimStart = processed.timeMap.sourceTime(at: player.time)
         player.seek(to: 0)
     }
 
     /// Trims the recording so it ends at the preview's current position.
     func endHere() {
         guard let processed else { return }
-        audioOptions.trimEnd = processed.timeMap.sourceTime(at: player.currentTime)
+        audioOptions.trimEnd = processed.timeMap.sourceTime(at: player.time)
     }
 
     func clearTrim() {
@@ -225,35 +235,67 @@ import UniformTypeIdentifiers
 
     // MARK: - Songs and talk
 
-    /// Whether the preview's current position is in a song.
-    var isSongAtPlayhead: Bool {
-        let time = player.currentTime
-        return performance.segments.first { $0.start <= time && time < $0.end }?.isMusic ?? false
+    /// Makes everything from `start` to `end` of the edited audio a song, or talk. For when the automatic guess got it
+    /// wrong.
+    func setSegment(from start: Double, to end: Double, isMusic: Bool) {
+        guard let processed, end > start else { return }
+        let sourceStart = processed.timeMap.sourceTime(at: start)
+        let sourceEnd = processed.timeMap.sourceTime(at: end)
+        guard sourceEnd > sourceStart else { return }
+
+        var edited = [ContentSegment]()
+        for segment in sourceSegments {
+            if segment.end <= sourceStart || segment.start >= sourceEnd {
+                edited.append(segment)
+                continue
+            }
+            if segment.start < sourceStart {
+                edited.append(ContentSegment(start: segment.start, end: sourceStart, isMusic: segment.isMusic))
+            }
+            if segment.end > sourceEnd {
+                edited.append(ContentSegment(start: sourceEnd, end: segment.end, isMusic: segment.isMusic))
+            }
+        }
+        edited.append(ContentSegment(start: sourceStart, end: sourceEnd, isMusic: isMusic))
+        commitSegments(edited)
     }
 
-    /// Turns the stretch under the preview's position from talk into a song, or the other way round, for when the
-    /// automatic guess got it wrong.
-    func flipSegmentAtPlayhead() {
-        guard let processed else { return }
-        let time = processed.timeMap.sourceTime(at: player.currentTime)
-        guard let index = sourceSegments.firstIndex(where: { $0.start <= time && time < $0.end }) else { return }
-        sourceSegments[index].isMusic.toggle()
+    /// Moves the border between two stretches that's at `from` in the edited audio to `to`.
+    func moveSegmentBorder(from: Double, to: Double) {
+        guard let processed, sourceSegments.count > 1 else { return }
+        let old = processed.timeMap.sourceTime(at: from)
+        let new = processed.timeMap.sourceTime(at: to)
+        // The border nearest where the drag started.
+        guard let index = (1..<sourceSegments.count).min(by: {
+            abs(sourceSegments[$0].start - old) < abs(sourceSegments[$1].start - old)
+        }) else { return }
+        let lowest = sourceSegments[index - 1].start + 0.5
+        let highest = sourceSegments[index].end - 0.5
+        guard highest > lowest else { return }
+        let time = min(max(new, lowest), highest)
+        var edited = sourceSegments
+        edited[index - 1].end = time
+        edited[index].start = time
+        commitSegments(edited)
+    }
+
+    func restoreDetectedSegments() {
+        sourceSegments = detectedSegments
+        segmentsWereEdited = false
+        rebuildPerformance()
+    }
+
+    private func commitSegments(_ segments: [ContentSegment]) {
         var merged = [ContentSegment]()
-        for segment in sourceSegments {
+        for segment in segments.sorted(by: { $0.start < $1.start }) where segment.end > segment.start {
             if let last = merged.last, last.isMusic == segment.isMusic {
-                merged[merged.count - 1].end = segment.end
+                merged[merged.count - 1].end = max(last.end, segment.end)
             } else {
                 merged.append(segment)
             }
         }
         sourceSegments = merged
         segmentsWereEdited = true
-        rebuildPerformance()
-    }
-
-    func restoreDetectedSegments() {
-        sourceSegments = detectedSegments
-        segmentsWereEdited = false
         rebuildPerformance()
     }
 
@@ -270,10 +312,27 @@ import UniformTypeIdentifiers
             return
         }
         let segments = sourceSegments
+        let windows = classifiedWindows
         let sensitivity = settings.mouthSensitivity
-        performance = await Task.detached(priority: .userInitiated) {
-            Performance.make(audio: processed, sourceSegments: segments, framesPerSecond: fps, mouthSensitivity: sensitivity)
+        let eyes = settings.listeningEyes
+        let cached = voiceLevels?.framesPerSecond == fps ? voiceLevels?.levels : nil
+        let (levels, built) = await Task.detached(priority: .userInitiated) {
+            let levels = cached ?? Performance.voiceLevels(processed.clip, framesPerSecond: fps)
+            let built = Performance.make(
+                audio: processed,
+                voiceLevels: levels,
+                sourceSegments: segments,
+                speechWindows: windows,
+                framesPerSecond: fps,
+                mouthSensitivity: sensitivity,
+                listeningEyes: eyes
+            )
+            return (levels, built)
         }.value
+        // A newer recording or edit may have arrived while this was being worked out.
+        guard self.processed.map({ $0.clip.frameCount == processed.clip.frameCount }) ?? false else { return }
+        voiceLevels = (levels, fps)
+        performance = built
     }
 
     // MARK: - Preview picture

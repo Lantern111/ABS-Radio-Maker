@@ -22,6 +22,16 @@ struct CharacterPanel: View {
             }
 
             Section {
+                Picker("노래 들을 때", selection: $studio.settings.listeningEyes) {
+                    ForEach(ListeningEyes.allCases) { style in
+                        Text(style.title).tag(style)
+                    }
+                }
+            } footer: {
+                Text("노래가 나오는 동안은 리듬에 맞춰 몸을 흔들어요. \"가끔 눈 감기\"는 대부분 눈을 뜨고 듣다가 가끔 몇 초씩 눈을 감아요.")
+            }
+
+            Section {
                 Picker("화면 속도", selection: $studio.settings.framesPerSecond) {
                     ForEach(StudioSettings.frameRateChoices, id: \.self) { fps in
                         Text("\(fps) fps").tag(fps)
