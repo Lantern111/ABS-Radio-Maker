@@ -70,12 +70,18 @@ struct Performance: Sendable {
         let halfOpen = Float(0.6 - 0.3 * mouthSensitivity)
         let wideOpen = halfOpen + 0.35
 
+        // Far quieter than the talking is never a voice. Without this, the hiss of a microphone switching on after a
+        // song has faded to silence looks loud next to the silence around it, and the mouth twitches.
+        let talkLevels = levels.indices.filter { !isMusic[$0] }.map { levels[$0] }.sorted()
+        let speechLevel = talkLevels.isEmpty ? -20 : talkLevels[Int(Double(talkLevels.count - 1) * 0.9)]
+        let quietest = speechLevel - 30
+
         var mouth = [UInt8](repeating: 0, count: count)
         var energy = [Float](repeating: 0, count: count)
         var smoothedEnergy: Float = 0
         for frame in 0..<count where levels.indices.contains(frame) && !isMusic[frame] {
             let range = localHigh[frame] - localLow[frame]
-            let level = range < 8 ? 0 : (levels[frame] - localLow[frame]) / range
+            let level = range < 8 || levels[frame] < quietest ? 0 : (levels[frame] - localLow[frame]) / range
             let someoneIsTalking = speechWindows.isEmpty
                 || ContentDetector.speech(at: sourceTimes[frame], in: speechWindows) >= 0.3
             if someoneIsTalking {
@@ -92,6 +98,7 @@ struct Performance: Sendable {
                 mouth[frame] = 1
             }
         }
+        removeTwitches(from: &mouth, framesPerSecond: fps)
 
         var listening = [Float](repeating: 0, count: count)
         var amount: Float = 0
@@ -147,6 +154,28 @@ struct Performance: Sendable {
             levels[frame] = 10 * log10(max(meanSquare, 1e-12))
         }
         return levels
+    }
+
+    /// Shuts the mouth for openings too short to be a syllable, about a tenth of a second or less, with the mouth shut for
+    /// at least 0.3 seconds on both sides. Those come from pops and clicks, like a microphone being switched on.
+    static func removeTwitches(from mouth: inout [UInt8], framesPerSecond fps: Double) {
+        let shortest = max(2, Int((0.12 * fps).rounded()))
+        let quietAround = max(1, Int((0.3 * fps).rounded()))
+        var frame = 0
+        while frame < mouth.count {
+            guard mouth[frame] > 0 else {
+                frame += 1
+                continue
+            }
+            var end = frame
+            while end < mouth.count, mouth[end] > 0 { end += 1 }
+            let shutBefore = mouth[max(0, frame - quietAround)..<frame].allSatisfy { $0 == 0 }
+            let shutAfter = mouth[end..<min(mouth.count, end + quietAround)].allSatisfy { $0 == 0 }
+            if end - frame < shortest, shutBefore, shutAfter {
+                for index in frame..<end { mouth[index] = 0 }
+            }
+            frame = end
+        }
     }
 
     /// The lowest or highest value within `reach` of each position.
