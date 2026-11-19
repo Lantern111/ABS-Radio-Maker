@@ -77,9 +77,12 @@ final class FrameRenderer: @unchecked Sendable {
         }
     }
 
-    /// The character's drawing for a pose, falling back to the plain drawing when that pose has no picture.
+    /// The character's drawing for a pose. Without a picture of its own, listening uses the eyes-closed drawing, and
+    /// anything else uses the plain one.
     func character(for drawing: LayerSlot) -> Placed? {
-        poses[drawing] ?? poses[.character]
+        if let placed = poses[drawing] { return placed }
+        if drawing == .listening, let eyesClosed = poses[.blink] { return eyesClosed }
+        return poses[.character]
     }
 
     /// Where the character's drawing goes for a pose: its position and size from the settings, then the sway around its

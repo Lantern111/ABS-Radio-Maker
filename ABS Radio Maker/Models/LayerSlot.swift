@@ -35,8 +35,8 @@ enum LayerSlot: String, CaseIterable, Identifiable, Codable, Sendable {
         case .desk: "캐릭터 앞에 놓이는 그림"
         case .mouthHalf: "작게 말할 때"
         case .mouthOpen: "크게 말할 때"
-        case .blink: "가끔 눈을 깜빡일 때"
-        case .listening: "노래가 나오는 동안의 모습"
+        case .blink: "눈을 깜빡일 때, 노래를 들으며 눈 감을 때"
+        case .listening: "비워 두면 눈 감음 그림을 써요"
         case .musicBackground: "비워 두면 기본 배경을 그대로 써요"
         }
     }
@@ -50,8 +50,7 @@ enum LayerSlot: String, CaseIterable, Identifiable, Codable, Sendable {
         case .mouthHalf: "default_character_mouth_half"
         case .mouthOpen: "default_character_mouth_open"
         case .blink: "default_character_blink"
-        case .listening: "default_character_listening"
-        case .musicBackground: nil
+        case .listening, .musicBackground: nil
         }
     }
 
