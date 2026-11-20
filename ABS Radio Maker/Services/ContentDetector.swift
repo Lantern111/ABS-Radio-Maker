@@ -20,15 +20,26 @@ struct ClassifiedWindow: Sendable {
 /// Finds where songs play, with the sound classifier built into macOS, so no model ships with the app.
 enum ContentDetector {
     static func classify(_ clip: AudioClip, progress: (Double) -> Void = { _ in }, isCancelled: () -> Bool = { false }) throws -> [ClassifiedWindow] {
-        guard let format = AVAudioFormat(standardFormatWithSampleRate: clip.sampleRate, channels: 1) else {
-            throw AudioClipError.cannotCreateBuffer
-        }
         let request = try SNClassifySoundRequest(classifierIdentifier: .version1)
         request.windowDuration = CMTime(seconds: 2, preferredTimescale: 1000)
         request.overlapFactor = 0.5
-
-        let analyzer = SNAudioStreamAnalyzer(format: format)
         let observer = Observer()
+        try analyze(clip, request: request, observer: observer, progress: progress, isCancelled: isCancelled)
+        return observer.windows.sorted { $0.time < $1.time }
+    }
+
+    /// Feeds a clip, mixed to mono a second at a time, through a sound analysis request.
+    static func analyze(
+        _ clip: AudioClip,
+        request: SNRequest,
+        observer: SNResultsObserving,
+        progress: (Double) -> Void,
+        isCancelled: () -> Bool
+    ) throws {
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: clip.sampleRate, channels: 1) else {
+            throw AudioClipError.cannotCreateBuffer
+        }
+        let analyzer = SNAudioStreamAnalyzer(format: format)
         try analyzer.add(request, withObserver: observer)
 
         let chunk = Int(clip.sampleRate) // one second at a time
@@ -54,7 +65,6 @@ enum ContentDetector {
             progress(Double(position) / Double(clip.frameCount))
         }
         analyzer.completeAnalysis()
-        return observer.windows.sorted { $0.time < $1.time }
     }
 
     /// Turns the classifier's guesses into steady stretches, so the character doesn't flip between talking and

@@ -68,6 +68,8 @@ import UniformTypeIdentifiers
     @ObservationIgnored private var source: SourceAudio?
     @ObservationIgnored private var detectedSegments: [ContentSegment] = []
     @ObservationIgnored private var classifiedWindows: [ClassifiedWindow] = []
+    /// When the announcer is talking, from the trained detector. Nil when the app has no model.
+    @ObservationIgnored private var talkMoments: [TalkDetector.Moment]?
     /// Voice levels for each frame of the edited audio, and the frame rate they were measured at.
     @ObservationIgnored private var voiceLevels: (levels: [Float], framesPerSecond: Int)?
     @ObservationIgnored private var processingTask: Task<Void, Never>?
@@ -122,7 +124,7 @@ import UniformTypeIdentifiers
                 let cancel = CancelFlag()
                 // Reading, finding songs, and moving the original to a file happen together, so the decoded
                 // recording is let go of as soon as the file is written.
-                let (windows, source) = try await withTaskCancellationHandler {
+                let (windows, moments, source) = try await withTaskCancellationHandler {
                     try await Task.detached(priority: .userInitiated) {
                         let clip = try AudioClip.load(from: url) { fraction in
                             Task { @MainActor in self?.updateWorking("녹음 파일을 읽는 중…", fraction) }
@@ -133,7 +135,17 @@ import UniformTypeIdentifiers
                         } isCancelled: {
                             cancel.isSet
                         }
-                        return (windows, try SourceAudio(clip))
+                        // The trained detector is better at telling talking over background music from music in a
+                        // pause. Without it, the built-in classifier decides.
+                        var moments: [TalkDetector.Moment]?
+                        if let url = TalkDetector.bundledModel, let model = try? TalkDetector.loadModel(at: url) {
+                            moments = try TalkDetector.detect(clip, model: model) { fraction in
+                                Task { @MainActor in self?.updateWorking("말하는 순간을 찾는 중…", fraction) }
+                            } isCancelled: {
+                                cancel.isSet
+                            }
+                        }
+                        return (windows, moments, try SourceAudio(clip))
                     }.value
                 } onCancel: {
                     cancel.set()
@@ -142,6 +154,7 @@ import UniformTypeIdentifiers
                 guard let self else { return }
                 self.source = source
                 classifiedWindows = windows
+                talkMoments = moments
                 recordingDuration = source.duration
                 detectedSegments = ContentDetector.segments(from: windows, duration: source.duration)
                 sourceSegments = detectedSegments
@@ -414,7 +427,7 @@ import UniformTypeIdentifiers
             return
         }
         let segments = sourceSegments
-        let windows = classifiedWindows
+        let talking = talkMoments.map(TalkTimeline.init(moments:)) ?? TalkTimeline(windows: classifiedWindows)
         let sensitivity = settings.mouthSensitivity
         let eyes = settings.listeningEyes
         let cached = voiceLevels?.framesPerSecond == fps ? voiceLevels?.levels : nil
@@ -424,7 +437,7 @@ import UniformTypeIdentifiers
                 audio: processed,
                 voiceLevels: levels,
                 sourceSegments: segments,
-                speechWindows: windows,
+                talking: talking,
                 framesPerSecond: fps,
                 mouthSensitivity: sensitivity,
                 listeningEyes: eyes

@@ -34,13 +34,13 @@ struct Performance: Sendable {
     /// - Parameters:
     ///   - voiceLevels: From `voiceLevels(_:framesPerSecond:)`, at the same frame rate.
     ///   - sourceSegments: Talk and songs, in the original recording's time.
-    ///   - speechWindows: The classifier's results, in the original recording's time, so the mouth stays shut where
-    ///     nobody is talking even though something else is playing.
+    ///   - talking: When someone is talking, in the original recording's time, so the mouth stays shut where nobody is
+    ///     talking even though something else is playing. Nil lets the mouth move anywhere outside songs.
     static func make(
         audio: ProcessedAudio,
         voiceLevels levels: [Float],
         sourceSegments: [ContentSegment],
-        speechWindows: [ClassifiedWindow],
+        talking: TalkTimeline?,
         framesPerSecond: Int,
         mouthSensitivity: Double,
         listeningEyes: ListeningEyes
@@ -82,8 +82,7 @@ struct Performance: Sendable {
         for frame in 0..<count where levels.indices.contains(frame) && !isMusic[frame] {
             let range = localHigh[frame] - localLow[frame]
             let level = range < 8 || levels[frame] < quietest ? 0 : (levels[frame] - localLow[frame]) / range
-            let someoneIsTalking = speechWindows.isEmpty
-                || ContentDetector.speech(at: sourceTimes[frame], in: speechWindows) >= 0.3
+            let someoneIsTalking = talking?.isTalking(at: sourceTimes[frame]) ?? true
             if someoneIsTalking {
                 mouth[frame] = level >= wideOpen ? 2 : level >= halfOpen ? 1 : 0
             }
