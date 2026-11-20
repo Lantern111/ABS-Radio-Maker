@@ -110,6 +110,62 @@ enum ContentDetector {
         return segments
     }
 
+    /// Second look at the talk stretches with the trained talk detector, which hears the announcers far better than
+    /// the built-in classifier. A stretch where they hardly talk was a song all along: a sung or rapped verse, a jingle.
+    ///
+    /// - A stretch where the detector hears talking less than a fifth of the time is a song, however long.
+    /// - One shorter than a minute with talking under 30% of the time is too.
+    /// - So is one under a minute with talking 30–55% of the time, if it's mixed like a song: the sides within 10 dB of
+    ///   the middle. A song's vocal comes with stereo reverb, while the announcer's mono microphone over background
+    ///   music, which is turned down, leaves the sides 11–13 dB under the middle.
+    static func refine(_ segments: [ContentSegment], talk moments: [TalkDetector.Moment], clip: AudioClip) -> [ContentSegment] {
+        guard !moments.isEmpty else { return segments }
+        var refined = segments.map { segment -> ContentSegment in
+            guard !segment.isMusic else { return segment }
+            let inside = moments.filter { $0.time >= segment.start && $0.time < segment.end }
+            guard !inside.isEmpty else { return segment }
+            let density = Double(inside.filter { $0.talk >= 0.65 }.count) / Double(inside.count)
+            let length = segment.end - segment.start
+            var isSong = density < 0.2 || length < 60 && density < 0.3
+            if !isSong, length < 60, density < 0.55, sideToMiddle(clip, from: segment.start, to: segment.end) >= -10 {
+                isSong = true
+            }
+            return ContentSegment(start: segment.start, end: segment.end, isMusic: isSong)
+        }
+        refined = merging(refined) { _ in false }
+        return refined
+    }
+
+    /// How loud the difference between left and right is, against their sum, in the voice band, in dB. Minus infinity
+    /// for mono.
+    static func sideToMiddle(_ clip: AudioClip, from start: Double, to end: Double) -> Double {
+        guard clip.channels.count >= 2 else { return -.infinity }
+        let range = max(0, Int(start * clip.sampleRate))..<min(clip.frameCount, Int(end * clip.sampleRate))
+        guard range.count > 1000 else { return -.infinity }
+        var middle = [Float](repeating: 0, count: range.count)
+        var side = [Float](repeating: 0, count: range.count)
+        clip.channels[0].withUnsafeBufferPointer { left in
+            clip.channels[1].withUnsafeBufferPointer { right in
+                for (index, frame) in range.enumerated() {
+                    middle[index] = (left[frame] + right[frame]) / 2
+                    side[index] = (left[frame] - right[frame]) / 2
+                }
+            }
+        }
+        let band = [
+            AudioProcessor.highPassCoefficients(frequency: 300, q: 0.7071, sampleRate: clip.sampleRate),
+            AudioProcessor.lowPassCoefficients(frequency: 3400, q: 0.7071, sampleRate: clip.sampleRate),
+        ]
+        AudioProcessor.filter(&middle, sections: band)
+        AudioProcessor.filter(&side, sections: band)
+        var middleSquare: Float = 0
+        var sideSquare: Float = 0
+        vDSP_measqv(middle, 1, &middleSquare, vDSP_Length(middle.count))
+        vDSP_measqv(side, 1, &sideSquare, vDSP_Length(side.count))
+        guard sideSquare > 0 else { return -.infinity }
+        return 10 * log10(Double(sideSquare) / Double(max(middleSquare, 1e-20)))
+    }
+
     /// Each value replaced by the average of itself and its neighbors within `reach`.
     static func averaged(_ values: [Double], reach: Int) -> [Double] {
         values.indices.map { index in

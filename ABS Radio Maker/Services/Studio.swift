@@ -124,7 +124,7 @@ import UniformTypeIdentifiers
                 let cancel = CancelFlag()
                 // Reading, finding songs, and moving the original to a file happen together, so the decoded
                 // recording is let go of as soon as the file is written.
-                let (windows, moments, source) = try await withTaskCancellationHandler {
+                let (windows, moments, segments, source) = try await withTaskCancellationHandler {
                     try await Task.detached(priority: .userInitiated) {
                         let clip = try AudioClip.load(from: url) { fraction in
                             Task { @MainActor in self?.updateWorking("녹음 파일을 읽는 중…", fraction) }
@@ -145,7 +145,12 @@ import UniformTypeIdentifiers
                                 cancel.isSet
                             }
                         }
-                        return (windows, moments, try SourceAudio(clip))
+                        // The trained detector also catches sung or rapped verses the built-in classifier took for talk.
+                        var segments = ContentDetector.segments(from: windows, duration: clip.duration)
+                        if let moments {
+                            segments = ContentDetector.refine(segments, talk: moments, clip: clip)
+                        }
+                        return (windows, moments, segments, try SourceAudio(clip))
                     }.value
                 } onCancel: {
                     cancel.set()
@@ -156,7 +161,7 @@ import UniformTypeIdentifiers
                 classifiedWindows = windows
                 talkMoments = moments
                 recordingDuration = source.duration
-                detectedSegments = ContentDetector.segments(from: windows, duration: source.duration)
+                detectedSegments = segments
                 sourceSegments = detectedSegments
                 segmentsWereEdited = false
                 await process(source)

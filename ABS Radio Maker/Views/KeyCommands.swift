@@ -52,9 +52,10 @@ import SwiftUI
         self.studio = studio
         guard monitor == nil else { return }
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            MainActor.assumeIsolated {
-                (self?.handle(event) ?? false) ? nil : event
-            }
+            // Local monitors run on the main thread, with the event the window is about to handle.
+            nonisolated(unsafe) let event = event
+            let handled = MainActor.assumeIsolated { self?.handle(event) ?? false }
+            return handled ? nil : event
         }
     }
 
