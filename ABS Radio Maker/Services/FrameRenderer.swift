@@ -20,6 +20,10 @@ final class FrameRenderer: @unchecked Sendable {
     let musicBackground: CGImage?
     let desk: Placed?
     private let poses: [LayerSlot: Placed]
+    /// The corner cover as it was given. It's fitted into the frame when drawn, because the frame can move.
+    private let cover: CGImage?
+    private let coverLock = NSLock()
+    private var composedCover: Placed?
     /// The bottom middle of the character, which it sways around.
     private let pivot: CGPoint
 
@@ -28,6 +32,7 @@ final class FrameRenderer: @unchecked Sendable {
         background = images[.background].flatMap { Self.filled($0, size: size, opaque: true) }
         musicBackground = images[.musicBackground].flatMap { Self.filled($0, size: size, opaque: true) }
         desk = images[.desk].flatMap { Self.placed($0, size: size) }
+        cover = images[.cover]
 
         var poses = [LayerSlot: Placed]()
         for slot in LayerSlot.allCases where slot.isCharacterPose {
@@ -68,6 +73,10 @@ final class FrameRenderer: @unchecked Sendable {
             context.restoreGState()
         }
 
+        if let cover = coverArt(settings: settings) {
+            draw(cover.image, in: cover.rect, context: context)
+        }
+
         if let character = character(for: pose.drawing) {
             drawCharacter(character, pose: pose, settings: settings, context: context)
         }
@@ -75,6 +84,54 @@ final class FrameRenderer: @unchecked Sendable {
         if let desk {
             draw(desk.image, in: desk.rect, context: context)
         }
+    }
+
+    /// The corner cover, fitted into the frame on the wall, behind glass. Nil without a cover. Made again only when the
+    /// frame changes size.
+    func coverArt(settings: StudioSettings) -> Placed? {
+        guard let cover else { return nil }
+        let rect = settings.coverFrame.rect(in: size).integral
+        guard rect.width >= 4, rect.height >= 4 else { return nil }
+        coverLock.lock()
+        defer { coverLock.unlock() }
+        if let composed = composedCover, composed.rect.size == rect.size {
+            let moved = Placed(image: composed.image, rect: rect)
+            composedCover = moved
+            return moved
+        }
+        guard let image = Self.framed(cover, size: rect.size) else { return nil }
+        let composed = Placed(image: image, rect: rect)
+        composedCover = composed
+        return composed
+    }
+
+    /// The cover fitted inside a frame of the given size with a thin mat around it, and a faint sheen across it like
+    /// the glass in the background's frame.
+    private static func framed(_ cover: CGImage, size: CGSize) -> CGImage? {
+        guard let context = makeContext(size: size) else { return nil }
+        context.interpolationQuality = .high
+        let mat = min(size.width, size.height) * 0.04
+        let room = CGRect(origin: .zero, size: size).insetBy(dx: mat, dy: mat)
+        let scale = min(room.width / CGFloat(cover.width), room.height / CGFloat(cover.height))
+        let fitted = CGSize(width: CGFloat(cover.width) * scale, height: CGFloat(cover.height) * scale)
+        let place = CGRect(x: room.midX - fitted.width / 2, y: room.midY - fitted.height / 2, width: fitted.width, height: fitted.height)
+        context.draw(cover, in: place)
+
+        // Two light bands rising to the right, kept to the cover.
+        context.clip(to: place)
+        context.setFillColor(CGColor(gray: 1, alpha: 0.10))
+        for (start, width) in [(0.18, 0.16), (0.42, 0.07)] {
+            let band = CGMutablePath()
+            let left = place.minX + place.width * start
+            band.move(to: CGPoint(x: left, y: place.minY))
+            band.addLine(to: CGPoint(x: left + place.width * width, y: place.minY))
+            band.addLine(to: CGPoint(x: left + place.width * (width + 0.55), y: place.maxY))
+            band.addLine(to: CGPoint(x: left + place.width * 0.55, y: place.maxY))
+            band.closeSubpath()
+            context.addPath(band)
+        }
+        context.fillPath()
+        return context.makeImage()
     }
 
     /// The character's drawing for a pose. Without a picture of its own, listening uses the eyes-closed drawing, and

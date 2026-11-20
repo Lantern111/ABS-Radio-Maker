@@ -24,10 +24,12 @@ final class SceneNSView: NSView {
     private let canvas = CALayer()
     private let backgroundLayer = CALayer()
     private let musicBackgroundLayer = CALayer()
+    private let coverLayer = CALayer()
     private let characterLayer = CALayer()
     private let deskLayer = CALayer()
     private weak var renderer: FrameRenderer?
     private var shownCharacter: CGImage?
+    private var shownCover: CGImage?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -39,7 +41,7 @@ final class SceneNSView: NSView {
         canvas.isGeometryFlipped = true
         canvas.masksToBounds = true
         canvas.backgroundColor = CGColor(gray: 0.12, alpha: 1)
-        for sublayer in [backgroundLayer, musicBackgroundLayer, characterLayer, deskLayer] {
+        for sublayer in [backgroundLayer, musicBackgroundLayer, coverLayer, characterLayer, deskLayer] {
             sublayer.contentsGravity = .resize
             sublayer.actions = ["contents": NSNull(), "bounds": NSNull(), "position": NSNull(), "transform": NSNull(), "opacity": NSNull()]
             canvas.addSublayer(sublayer)
@@ -84,6 +86,17 @@ final class SceneNSView: NSView {
             }
         }
         musicBackgroundLayer.opacity = renderer.musicBackground == nil ? 0 : Float(pose.listening)
+
+        if let cover = renderer.coverArt(settings: settings) {
+            if shownCover !== cover.image {
+                coverLayer.contents = cover.image
+                shownCover = cover.image
+            }
+            coverLayer.frame = cover.rect
+        } else if shownCover != nil {
+            coverLayer.contents = nil
+            shownCover = nil
+        }
 
         guard let character = renderer.character(for: pose.drawing) else {
             characterLayer.contents = nil

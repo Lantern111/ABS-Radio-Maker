@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 /// How often the character shuts its eyes to enjoy a song.
@@ -35,6 +36,22 @@ enum ListeningEyes: String, Codable, CaseIterable, Identifiable, Sendable {
     }
 }
 
+/// Where the corner cover goes: the inside of the frame on the studio wall, as fractions of the screen, measured from
+/// the top left. The cover is fitted inside without cropping.
+struct CoverFrame: Codable, Equatable, Sendable {
+    var x: Double
+    var y: Double
+    var width: Double
+    var height: Double
+
+    /// The frame on the right-hand wall of the default studio background.
+    static let studioWall = CoverFrame(x: 0.8349, y: 0.3167, width: 0.1178, height: 0.2487)
+
+    func rect(in size: CGSize) -> CGRect {
+        CGRect(x: x * size.width, y: y * size.height, width: width * size.width, height: height * size.height)
+    }
+}
+
 /// How the character sits in the scene and how lively it is. Saved between launches.
 struct StudioSettings: Codable, Equatable, Sendable {
     /// Moves the character sideways, as a fraction of the screen width. Positive is to the right.
@@ -49,6 +66,7 @@ struct StudioSettings: Codable, Equatable, Sendable {
     var mouthSensitivity = 0.5
     var listeningEyes = ListeningEyes.sometimes
     var framesPerSecond = 30
+    var coverFrame = CoverFrame.studioWall
 
     static let frameRateChoices = [24, 30]
 
@@ -65,6 +83,7 @@ struct StudioSettings: Codable, Equatable, Sendable {
         mouthSensitivity = try container.decodeIfPresent(Double.self, forKey: .mouthSensitivity) ?? defaults.mouthSensitivity
         listeningEyes = (try? container.decodeIfPresent(ListeningEyes.self, forKey: .listeningEyes)) ?? defaults.listeningEyes
         framesPerSecond = try container.decodeIfPresent(Int.self, forKey: .framesPerSecond) ?? defaults.framesPerSecond
+        coverFrame = (try? container.decodeIfPresent(CoverFrame.self, forKey: .coverFrame)) ?? defaults.coverFrame
     }
 
     private static let key = "studioSettings"

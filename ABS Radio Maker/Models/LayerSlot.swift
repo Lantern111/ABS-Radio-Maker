@@ -12,6 +12,7 @@ enum LayerSlot: String, CaseIterable, Identifiable, Codable, Sendable {
     case blink
     case listening
     case musicBackground
+    case cover
 
     var id: String { rawValue }
 
@@ -25,6 +26,7 @@ enum LayerSlot: String, CaseIterable, Identifiable, Codable, Sendable {
         case .blink: "눈 감음 (깜빡임)"
         case .listening: "노래 들을 때"
         case .musicBackground: "노래 나올 때 배경"
+        case .cover: "코너 표지"
         }
     }
 
@@ -38,6 +40,7 @@ enum LayerSlot: String, CaseIterable, Identifiable, Codable, Sendable {
         case .blink: "눈을 깜빡일 때, 노래를 들으며 눈 감을 때"
         case .listening: "비워 두면 눈 감음 그림을 써요"
         case .musicBackground: "비워 두면 기본 배경을 그대로 써요"
+        case .cover: "배경의 액자 안에 들어가요"
         }
     }
 
@@ -50,7 +53,7 @@ enum LayerSlot: String, CaseIterable, Identifiable, Codable, Sendable {
         case .mouthHalf: "default_character_mouth_half"
         case .mouthOpen: "default_character_mouth_open"
         case .blink: "default_character_blink"
-        case .listening, .musicBackground: nil
+        case .listening, .musicBackground, .cover: nil
         }
     }
 
@@ -58,13 +61,14 @@ enum LayerSlot: String, CaseIterable, Identifiable, Codable, Sendable {
     var isCharacterPose: Bool {
         switch self {
         case .character, .mouthHalf, .mouthOpen, .blink, .listening: true
-        case .background, .desk, .musicBackground: false
+        case .background, .desk, .musicBackground, .cover: false
         }
     }
 
     static let sections: [(title: String, slots: [LayerSlot])] = [
         ("기본 레이어", [.background, .character, .desk]),
         ("캐릭터 표정", [.mouthHalf, .mouthOpen, .blink, .listening]),
+        ("코너 표지", [.cover]),
         ("노래 구간", [.musicBackground]),
     ]
 }

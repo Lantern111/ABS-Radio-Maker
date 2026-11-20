@@ -29,7 +29,7 @@ struct ContentView: View {
                 Divider()
 
                 switch tab {
-                case .layers: LayersPanel(library: studio.layers)
+                case .layers: LayersPanel(library: studio.layers, coverFrame: $studio.settings.coverFrame)
                 case .character: CharacterPanel(studio: studio)
                 case .audio: AudioPanel(studio: studio)
                 }

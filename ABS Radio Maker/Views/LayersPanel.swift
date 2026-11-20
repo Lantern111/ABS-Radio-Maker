@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 /// Every picture the video is built from, each replaceable by dropping in a new one.
 struct LayersPanel: View {
     let library: LayerLibrary
+    @Binding var coverFrame: CoverFrame
 
     var body: some View {
         ScrollView {
@@ -19,6 +20,9 @@ struct LayersPanel: View {
                             .font(.headline)
                         ForEach(section.slots) { slot in
                             LayerRow(library: library, slot: slot)
+                            if slot == .cover {
+                                CoverFrameControls(frame: $coverFrame)
+                            }
                         }
                     }
                 }
@@ -137,5 +141,35 @@ private struct Checkerboard: View {
                 }
             }
         }
+    }
+}
+
+/// Lines the cover up with the frame, for a background whose frame is somewhere else.
+private struct CoverFrameControls: View {
+    @Binding var frame: CoverFrame
+    @State private var isOpen = false
+
+    var body: some View {
+        DisclosureGroup("액자 위치 맞추기", isExpanded: $isOpen) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("배경을 바꿔서 액자 자리가 달라졌을 때만 맞추면 돼요. 표지는 잘리지 않게 액자 안에 맞춰 들어가요.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                SettingSlider(title: "가로 위치", value: $frame.x, range: 0...0.95, format: percent)
+                SettingSlider(title: "세로 위치", value: $frame.y, range: 0...0.95, format: percent)
+                SettingSlider(title: "너비", value: $frame.width, range: 0.03...0.6, format: percent)
+                SettingSlider(title: "높이", value: $frame.height, range: 0.03...0.9, format: percent)
+                Button("기본 배경의 액자에 맞추기") { frame = .studioWall }
+                    .controlSize(.small)
+                    .disabled(frame == .studioWall)
+            }
+            .padding(.top, 6)
+        }
+        .padding(.horizontal, 8)
+    }
+
+    private func percent(_ value: Double) -> String {
+        String(format: "%.1f%%", value * 100)
     }
 }
