@@ -35,6 +35,7 @@ import SwiftUI
                     showsChannelStrip.toggle()
                 }
                 .keyboardShortcut("i", modifiers: [.command, .option])
+                OpenEQButton()
             }
 
             CommandGroup(replacing: .help) {
@@ -52,9 +53,23 @@ import SwiftUI
             }
         }
 
+        Window("채널 EQ", id: "eq") {
+            EQWindow(studio: studio)
+        }
+        .defaultSize(width: 900, height: 560)
+
         Settings {
             SettingsView(updater: updaterController.updater)
         }
+    }
+}
+
+private struct OpenEQButton: View {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Button("채널 EQ") { openWindow(id: "eq") }
+            .keyboardShortcut("e", modifiers: [.command, .option])
     }
 }
 

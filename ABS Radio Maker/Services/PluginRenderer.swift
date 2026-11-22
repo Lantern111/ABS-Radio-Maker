@@ -5,8 +5,14 @@ struct UnitBox: @unchecked Sendable {
     let unit: AVAudioUnit
 }
 
-/// Runs the whole cleaned-up recording through copies of the plug-ins, as fast as they'll go, for the export and for
-/// working out the mouth. The preview hears the same plug-ins live.
+/// An effect for the offline render, and the stretches it works on.
+struct RenderInsert: @unchecked Sendable {
+    let unit: AVAudioUnit
+    let scope: InsertScope
+}
+
+/// Runs the whole cleaned-up recording through copies of the EQ and the plug-ins, as fast as they'll go, for the export
+/// and for working out the mouth. The preview hears the same effects live.
 enum PluginRenderer {
     enum RenderError: LocalizedError {
         case failed(String)
@@ -30,11 +36,43 @@ enum PluginRenderer {
         }
     }
 
+    /// Mixes an effect's output with what went into it, for an effect that only works on some stretches.
+    private struct Blend {
+        let envelope: ScopeEnvelope
+        let scope: InsertScope
+    }
+
+    /// Effects next to each other that work on the same stretches go through in one pass; each pass that only works
+    /// on some stretches is faded in and out over the rest.
     static func render(
         _ cleaned: consuming CleanedAudio,
-        through units: [UnitBox],
+        inserts: [RenderInsert],
+        envelope: ScopeEnvelope,
         progress: (Double) -> Void = { _ in },
         isCancelled: () -> Bool = { false }
+    ) throws -> CleanedAudio {
+        let groups = InsertScope.groups(inserts, scope: \.scope)
+        var audio = consume cleaned
+        for (index, group) in groups.enumerated() {
+            let done = Double(index)
+            let total = Double(groups.count)
+            audio = try render(
+                consume audio,
+                through: group.items.map { UnitBox(unit: $0.unit) },
+                blend: group.scope == .everything ? nil : Blend(envelope: envelope, scope: group.scope),
+                progress: { progress((done + $0) / total) },
+                isCancelled: isCancelled
+            )
+        }
+        return audio
+    }
+
+    private static func render(
+        _ cleaned: consuming CleanedAudio,
+        through units: [UnitBox],
+        blend: Blend?,
+        progress: (Double) -> Void,
+        isCancelled: () -> Bool
     ) throws -> CleanedAudio {
         let timeMap = cleaned.timeMap
         let rate = cleaned.clip.sampleRate
@@ -87,29 +125,52 @@ enum PluginRenderer {
         let wanted = frameCount + delay
         var output = (0..<2).map { _ -> [Float] in
             var samples = [Float]()
-            samples.reserveCapacity(wanted)
+            samples.reserveCapacity(frameCount)
             return samples
         }
         guard let scratch = AVAudioPCMBuffer(pcmFormat: engine.manualRenderingFormat, frameCapacity: chunk) else {
             throw RenderError.failed("buffer")
         }
-        while output[0].count < wanted {
+        var gains = [Float](repeating: 1, count: Int(chunk))
+        var rendered = 0
+        while output[0].count < frameCount {
             if isCancelled() { throw CancellationError() }
-            let frames = AVAudioFrameCount(min(Int(chunk), wanted - output[0].count))
+            let frames = AVAudioFrameCount(min(Int(chunk), wanted - rendered))
             let status = try engine.renderOffline(frames, to: scratch)
             guard status == .success, let data = scratch.floatChannelData else {
                 throw RenderError.failed("render status \(status.rawValue)")
             }
             let got = Int(scratch.frameLength)
             guard got > 0 else { throw RenderError.failed("no output") }
-            for channel in 0..<2 {
-                let from = data[min(channel, Int(scratch.format.channelCount) - 1)]
-                output[channel].append(contentsOf: UnsafeBufferPointer(start: from, count: got))
+            let skipped = min(max(delay - rendered, 0), got)
+            rendered += got
+            let kept = min(got - skipped, frameCount - output[0].count)
+            if kept > 0 {
+                let at = output[0].count
+                for channel in 0..<2 {
+                    let from = data[min(channel, Int(scratch.format.channelCount) - 1)] + skipped
+                    output[channel].append(contentsOf: UnsafeBufferPointer(start: from, count: kept))
+                }
+                if let blend {
+                    gains.withUnsafeMutableBufferPointer { gains in
+                        blend.envelope.fill(gains.baseAddress!, for: blend.scope, from: at, count: kept, sampleRate: rate)
+                    }
+                    for channel in 0..<2 {
+                        let dry = feeder.channels[min(channel, feeder.channels.count - 1)]
+                        dry.withUnsafeBufferPointer { dry in
+                            gains.withUnsafeBufferPointer { gains in
+                                output[channel].withUnsafeMutableBufferPointer { wet in
+                                    for index in 0..<kept {
+                                        let original = dry[at + index]
+                                        wet[at + index] = original + gains[index] * (wet[at + index] - original)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            progress(Double(output[0].count) / Double(wanted))
-        }
-        if delay > 0 {
-            for channel in 0..<2 { output[channel].removeFirst(delay) }
+            progress(Double(rendered) / Double(wanted))
         }
         return CleanedAudio(clip: AudioClip(channels: output, sampleRate: rate), timeMap: timeMap)
     }

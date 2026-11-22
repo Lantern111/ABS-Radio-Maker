@@ -38,7 +38,9 @@ import SwiftUI
             Shortcut(keys: "⌘ + 스크롤, 핀치", action: "마우스 위치에서 확대 / 축소"),
         ]),
         ("화면", [
-            Shortcut(keys: "⌥⌘I", action: "채널 스트립(플러그인·출력 레벨) 보기 / 숨기기"),
+            Shortcut(keys: "⌥⌘I", action: "채널 스트립(EQ·플러그인·출력 레벨) 보기 / 숨기기"),
+            Shortcut(keys: "⌥⌘E", action: "채널 EQ 창 열기"),
+            Shortcut(keys: "스페이스바, J / K / L", action: "EQ·플러그인 창에서도 재생 / 정지"),
         ]),
         ("파일", [
             Shortcut(keys: "⌘O", action: "녹음 열기"),
@@ -78,20 +80,33 @@ import SwiftUI
         static let end: UInt16 = 119
     }
 
-    /// Whether the key was one of ours. Keys that aren't go on to the window as usual.
+    /// Whether the key was one of ours. Keys that aren't go on to the window as usual. In other windows, like the EQ
+    /// and the plug-ins', only the playback keys work, so a sound can be played while it's being shaped.
     private func handle(_ event: NSEvent) -> Bool {
-        guard let studio, let window, event.window === window, window.attachedSheet == nil, NSApp.modalWindow == nil else {
-            return false
-        }
+        guard let studio, let window, let keyWindow = event.window, window.attachedSheet == nil, NSApp.modalWindow == nil,
+              keyWindow.attachedSheet == nil
+        else { return false }
         // Typing in a text field keeps its keys.
-        if window.firstResponder is NSText { return false }
+        if keyWindow.firstResponder is NSText { return false }
 
         let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
         let key = event.charactersIgnoringModifiers?.lowercased() ?? ""
         let player = studio.player
         let timeline = studio.timeline
         let hasRecording = studio.hasRecording
-        let canEdit = hasRecording && !studio.isBusy
+        let canEdit = studio.canEditSegments
+
+        if keyWindow !== window {
+            guard modifiers.isEmpty, hasRecording else { return false }
+            switch (event.keyCode, key) {
+            case (Key.space, _): player.togglePlayback()
+            case (_, "l"): player.playFaster()
+            case (_, "k"): player.pause()
+            case (_, "j"): studio.jump(to: player.time - 5)
+            default: return false
+            }
+            return true
+        }
 
         switch (event.keyCode, modifiers) {
         case (Key.space, []):

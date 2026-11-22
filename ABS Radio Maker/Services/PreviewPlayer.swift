@@ -1,6 +1,7 @@
 import Accelerate
 import AVFoundation
 import Observation
+import os
 
 /// What the meter shows, in dBFS for the levels and LUFS for loudness.
 struct MeterReading: Equatable, Sendable {
@@ -8,6 +9,8 @@ struct MeterReading: Equatable, Sendable {
     var rms: [Float] = [-120, -120]
     /// The highest peak lately, held for a moment so it can be read.
     var hold: [Float] = [-120, -120]
+    /// The highest peak since the readout was last clicked, as Logic Pro shows above its meters.
+    var highest: Float = -120
     /// A sample reached full scale. Stays lit until clicked.
     var clipped = false
     /// Loudness over the last 0.4 seconds.
@@ -18,9 +21,15 @@ struct MeterReading: Equatable, Sendable {
     static let silent = MeterReading()
 }
 
-/// Plays the cleaned-up recording through the plug-ins live, then the same loudness gain the export gets and a limiter,
-/// so the preview sounds like the finished video and plug-in settings can be heard as they change. The picture and
-/// the timeline follow `time`; the meter follows `meter`.
+/// An effect in the preview, and the stretches it works on.
+struct PlayerInsert {
+    let unit: AVAudioUnit
+    let scope: InsertScope
+}
+
+/// Plays the cleaned-up recording through the EQ and plug-ins live, then the same loudness gain the export gets and a
+/// limiter, so the preview sounds like the finished video and settings can be heard as they change. The picture and
+/// the timeline follow `time`; the meter follows `meter`; the spectrum follows `spectrum`.
 @MainActor @Observable final class PreviewPlayer {
     private(set) var isPlaying = false
     private(set) var duration: Double = 0
@@ -29,6 +38,7 @@ struct MeterReading: Equatable, Sendable {
     /// 1 is normal speed. Pressing L again while playing doubles it, up to 2.
     private(set) var rate: Float = 1
     private(set) var meter = MeterReading.silent
+    let spectrum = SpectrumAnalyzer()
 
     @ObservationIgnored private let engine = AVAudioEngine()
     @ObservationIgnored private let node = AVAudioPlayerNode()
@@ -41,22 +51,40 @@ struct MeterReading: Equatable, Sendable {
         componentFlags: 0,
         componentFlagsMask: 0
     ))
-    @ObservationIgnored private var effects: [AVAudioUnit] = []
+    @ObservationIgnored private var inserts: [PlayerInsert] = []
+    /// For effects that only work on talk or only on songs: the effect and the untouched sound side by side, each
+    /// turned up and down as the stretches change.
+    @ObservationIgnored private var blends: [Blend] = []
+    @ObservationIgnored private var envelope = ScopeEnvelope()
     @ObservationIgnored private var file: AVAudioFile?
     /// The frame of the file the current playback was scheduled from.
     @ObservationIgnored private var scheduledFrom: AVAudioFramePosition = 0
     /// Goes up with every new schedule, so a finished-playing message from an old one is ignored.
     @ObservationIgnored private var generation = 0
     @ObservationIgnored private var clock: Timer?
-    @ObservationIgnored private var levels: LevelTap?
+    @ObservationIgnored private let output = OutputTap()
     @ObservationIgnored private var holdSince: [Date] = [.distantPast, .distantPast]
     @ObservationIgnored private var stoppedAt: Date?
+
+    private struct Blend {
+        let scope: InsertScope
+        let wet: AVAudioMixerNode
+        let dry: AVAudioMixerNode
+        let sum: AVAudioMixerNode
+        /// Holds the untouched sound back by as much as the effects do, so the two line up.
+        let delay: AVAudioUnitDelay?
+
+        var nodes: [AVAudioNode] { [wet, dry, sum] + (delay.map { [$0] } ?? []) }
+    }
 
     init() {
         engine.attach(node)
         engine.attach(speed)
         engine.attach(gain)
         engine.attach(limiter)
+        // The meter and the spectrum listen to what comes out of the limiter, block by block as it's played, which
+        // is smoother than a tap: taps only hand over a tenth of a second at a time.
+        AudioUnitAddRenderNotify(limiter.audioUnit, outputRenderNotify, Unmanaged.passUnretained(output).toOpaque())
         connect()
         NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
             // The output device changed or went away, which stops the engine. Playback stops where it was.
@@ -71,23 +99,75 @@ struct MeterReading: Equatable, Sendable {
         file?.processingFormat ?? AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 2)!
     }
 
-    /// Player → speed → plug-ins → loudness gain → limiter → output, with the meter listening at the end.
-    private func connect() {
-        let chain: [AVAudioNode] = [node, speed] + effects + [gain, limiter]
-        for item in chain { engine.disconnectNodeOutput(item) }
-        let format = format
-        for (from, to) in zip(chain, chain.dropFirst()) {
-            engine.connect(from, to: to, format: format)
-        }
-        engine.connect(limiter, to: engine.mainMixerNode, format: format)
+    var sampleRate: Double { format.sampleRate }
 
-        let mixer = engine.mainMixerNode
-        mixer.removeTap(onBus: 0)
-        let outputFormat = mixer.outputFormat(forBus: 0)
-        let tap = LevelTap(sampleRate: outputFormat.sampleRate, channels: Int(outputFormat.channelCount))
-        levels = tap
-        mixer.installTap(onBus: 0, bufferSize: 2048, format: outputFormat) { buffer, _ in
-            tap.measure(buffer)
+    /// Player → speed → EQ and plug-ins → loudness gain → limiter → output, with the meter listening at the end.
+    private func connect() {
+        let old: [AVAudioNode] = [node, speed] + inserts.map(\.unit) + blends.flatMap(\.nodes) + [gain, limiter]
+        for item in old { engine.disconnectNodeOutput(item) }
+        for blend in blends { blend.nodes.forEach(engine.detach) }
+        blends = []
+
+        let format = format
+        engine.connect(node, to: speed, format: format)
+        var last: AVAudioNode = speed
+        for group in InsertScope.groups(inserts, scope: \.scope) {
+            let units = group.items.map(\.unit)
+            guard group.scope != .everything else {
+                for unit in units {
+                    engine.connect(last, to: unit, format: format)
+                    last = unit
+                }
+                continue
+            }
+            let blend = makeBlend(scope: group.scope, latency: units.reduce(0) { $0 + $1.auAudioUnit.latency })
+            blend.nodes.forEach(engine.attach)
+            // The sound splits: one side through the effects, the other untouched.
+            let dryInput: AVAudioNode = blend.delay ?? blend.dry
+            engine.connect(last, to: [
+                AVAudioConnectionPoint(node: units[0], bus: 0),
+                AVAudioConnectionPoint(node: dryInput, bus: 0),
+            ], fromBus: 0, format: format)
+            for (from, to) in zip(units, units.dropFirst()) {
+                engine.connect(from, to: to, format: format)
+            }
+            engine.connect(units.last!, to: blend.wet, format: format)
+            if let delay = blend.delay {
+                engine.connect(delay, to: blend.dry, format: format)
+            }
+            engine.connect(blend.wet, to: blend.sum, fromBus: 0, toBus: 0, format: format)
+            engine.connect(blend.dry, to: blend.sum, fromBus: 0, toBus: 1, format: format)
+            blends.append(blend)
+            last = blend.sum
+        }
+        engine.connect(last, to: gain, format: format)
+        engine.connect(gain, to: limiter, format: format)
+        engine.connect(limiter, to: engine.mainMixerNode, format: format)
+        applyBlends(at: time)
+        output.configure(sampleRate: format.sampleRate, channels: Int(format.channelCount))
+    }
+
+    private func makeBlend(scope: InsertScope, latency: TimeInterval) -> Blend {
+        var delay: AVAudioUnitDelay?
+        if latency > 0 {
+            let unit = AVAudioUnitDelay()
+            unit.delayTime = min(latency, 2)
+            unit.feedback = 0
+            unit.wetDryMix = 100
+            unit.lowPassCutoff = Float(format.sampleRate / 2)
+            delay = unit
+        }
+        return Blend(scope: scope, wet: AVAudioMixerNode(), dry: AVAudioMixerNode(), sum: AVAudioMixerNode(), delay: delay)
+    }
+
+    /// Turns each effect that only works on some stretches up or down for a moment of the recording.
+    private func applyBlends(at time: Double) {
+        for blend in blends {
+            let amount = envelope.amount(for: blend.scope, at: time)
+            if blend.wet.outputVolume != amount {
+                blend.wet.outputVolume = amount
+                blend.dry.outputVolume = 1 - amount
+            }
         }
     }
 
@@ -107,20 +187,28 @@ struct MeterReading: Equatable, Sendable {
         time = 0
     }
 
-    /// The plug-ins that play live, in order. Playback carries on where it was.
-    func setEffects(_ units: [AVAudioUnit]) {
-        guard units.map(ObjectIdentifier.init) != effects.map(ObjectIdentifier.init) else { return }
+    /// The EQ and plug-ins that play live, in order. Playback carries on where it was.
+    func setInserts(_ new: [PlayerInsert]) {
+        let same = new.count == inserts.count && zip(new, inserts).allSatisfy { $0.unit === $1.unit && $0.scope == $1.scope }
+        guard !same else { return }
         let wasPlaying = isPlaying
+        let playingRate = rate
         if wasPlaying { pause() }
-        for unit in effects where !units.contains(where: { $0 === unit }) {
-            engine.detach(unit)
+        for old in inserts where !new.contains(where: { $0.unit === old.unit }) {
+            engine.detach(old.unit)
         }
-        for unit in units where !effects.contains(where: { $0 === unit }) {
-            engine.attach(unit)
+        for insert in new where !inserts.contains(where: { $0.unit === insert.unit }) {
+            engine.attach(insert.unit)
         }
-        effects = units
+        inserts = new
         connect()
-        if wasPlaying { play(rate: rate) }
+        if wasPlaying { play(rate: playingRate) }
+    }
+
+    /// Where talk and songs are, in the preview's time, and how long the fade between them is.
+    func setEnvelope(_ envelope: ScopeEnvelope) {
+        self.envelope = envelope
+        applyBlends(at: time)
     }
 
     /// The loudness step's gain, in dB, so the preview is as loud as the export.
@@ -145,6 +233,7 @@ struct MeterReading: Equatable, Sendable {
                 return
             }
         }
+        applyBlends(at: time)
         schedule(from: time)
         node.play()
         isPlaying = true
@@ -170,6 +259,7 @@ struct MeterReading: Equatable, Sendable {
 
     func seek(to newTime: Double) {
         time = min(max(newTime, 0), duration)
+        applyBlends(at: time)
         if isPlaying {
             schedule(from: time)
             node.play()
@@ -178,6 +268,7 @@ struct MeterReading: Equatable, Sendable {
 
     func resetClip() {
         meter.clipped = false
+        meter.highest = -120
     }
 
     // MARK: - Playing
@@ -218,7 +309,7 @@ struct MeterReading: Equatable, Sendable {
         stoppedAt = Date()
     }
 
-    // MARK: - Clock and meter
+    // MARK: - Clock, meter, and spectrum
 
     private func startClock() {
         guard clock == nil else { return }
@@ -233,21 +324,24 @@ struct MeterReading: Equatable, Sendable {
     private func tick() {
         if isPlaying {
             time = min(position, duration)
+            applyBlends(at: time)
         }
         updateMeter()
-        // After stopping, the meter falls back to silence, then the clock rests.
+        spectrum.update(from: output, sampleRate: format.sampleRate)
+        // After stopping, the meter and spectrum fall back to silence, then the clock rests.
         if !isPlaying, let stoppedAt, Date().timeIntervalSince(stoppedAt) > 2 {
             clock?.invalidate()
             clock = nil
             var silent = MeterReading.silent
             silent.clipped = meter.clipped
+            silent.highest = meter.highest
             meter = silent
+            spectrum.clear()
         }
     }
 
     private func updateMeter() {
-        guard let levels else { return }
-        let fresh = levels.take()
+        let fresh = output.takeLevels()
         let fall: Float = 26.0 / 30 // dB per tick: 26 dB a second, like a desk meter
         let now = Date()
         var reading = meter
@@ -256,6 +350,7 @@ struct MeterReading: Equatable, Sendable {
             let rms = channel < fresh.rms.count ? fresh.rms[channel] : -120
             reading.peak[channel] = max(peak, meter.peak[channel] - fall)
             reading.rms[channel] = max(rms, meter.rms[channel] - fall)
+            reading.highest = max(reading.highest, peak)
             if peak >= meter.hold[channel] {
                 reading.hold[channel] = peak
                 holdSince[channel] = now
@@ -270,10 +365,114 @@ struct MeterReading: Equatable, Sendable {
     }
 }
 
-/// Measures what comes out of the preview. The engine calls `measure` on its own thread; the clock calls `take`.
-/// Loudness is K-weighted as BS.1770 describes, the same as the export's loudness step.
-final class LevelTap: @unchecked Sendable {
-    private let lock = NSLock()
+/// Called by the limiter on the audio thread after each block it plays.
+private func outputRenderNotify(
+    _ refCon: UnsafeMutableRawPointer,
+    _ flags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
+    _ timeStamp: UnsafePointer<AudioTimeStamp>,
+    _ bus: UInt32,
+    _ frames: UInt32,
+    _ data: UnsafeMutablePointer<AudioBufferList>?
+) -> OSStatus {
+    guard flags.pointee.contains(.unitRenderAction_PostRender),
+          !flags.pointee.contains(.unitRenderAction_PostRenderError),
+          bus == 0, let data
+    else { return noErr }
+    let tap = Unmanaged<OutputTap>.fromOpaque(refCon).takeUnretainedValue()
+    tap.receive(UnsafeMutableAudioBufferListPointer(data), frames: Int(frames))
+    return noErr
+}
+
+/// What the preview plays, as it plays: levels for the meter and the latest stretch of sound for the spectrum. The
+/// audio thread hands blocks to `receive`; the clock reads them on the main thread.
+final class OutputTap: @unchecked Sendable {
+    private let lock: UnsafeMutablePointer<os_unfair_lock>
+    private var levels: LevelTap
+    /// The last `ringSize` samples, left and right together, for the spectrum.
+    private let ring: UnsafeMutablePointer<Float>
+    private var written = 0
+    static let ringSize = 32_768
+
+    init() {
+        lock = .allocate(capacity: 1)
+        lock.initialize(to: os_unfair_lock())
+        levels = LevelTap(sampleRate: 44_100, channels: 2)
+        ring = .allocate(capacity: Self.ringSize)
+        ring.initialize(repeating: 0, count: Self.ringSize)
+    }
+
+    deinit {
+        lock.deallocate()
+        ring.deallocate()
+    }
+
+    func configure(sampleRate: Double, channels: Int) {
+        let fresh = LevelTap(sampleRate: sampleRate, channels: channels)
+        os_unfair_lock_lock(lock)
+        let old = levels
+        levels = fresh
+        os_unfair_lock_unlock(lock)
+        _ = old
+    }
+
+    func receive(_ buffers: UnsafeMutableAudioBufferListPointer, frames: Int) {
+        guard frames > 0, buffers.count > 0 else { return }
+        os_unfair_lock_lock(lock)
+        defer { os_unfair_lock_unlock(lock) }
+        levels.measure(buffers, frames: frames)
+        // Left and right are averaged, as a spectrum meter does.
+        guard let left = buffers[0].mData?.assumingMemoryBound(to: Float.self) else { return }
+        let interleaved = Int(buffers[0].mNumberChannels) > 1
+        let right: UnsafeMutablePointer<Float>
+        let stride: Int
+        if interleaved {
+            right = left + 1
+            stride = Int(buffers[0].mNumberChannels)
+        } else {
+            right = (buffers.count > 1 ? buffers[1].mData?.assumingMemoryBound(to: Float.self) : nil) ?? left
+            stride = 1
+        }
+        let mask = Self.ringSize - 1
+        var position = written & mask
+        for index in 0..<frames {
+            ring[position] = (left[index * stride] + right[index * stride]) * 0.5
+            position = (position + 1) & mask
+        }
+        written += frames
+    }
+
+    func takeLevels() -> LevelTap.Reading {
+        os_unfair_lock_lock(lock)
+        defer { os_unfair_lock_unlock(lock) }
+        return levels.take()
+    }
+
+    /// Copies the latest `count` samples, oldest first.
+    func latest(_ count: Int, into destination: UnsafeMutablePointer<Float>) {
+        let count = min(count, Self.ringSize)
+        os_unfair_lock_lock(lock)
+        defer { os_unfair_lock_unlock(lock) }
+        let mask = Self.ringSize - 1
+        let start = (written - count) & mask
+        let first = min(count, Self.ringSize - start)
+        destination.update(from: ring + start, count: first)
+        if first < count {
+            (destination + first).update(from: ring, count: count - first)
+        }
+    }
+}
+
+/// Measures what comes out of the preview. Loudness is K-weighted as BS.1770 describes, the same as the export's
+/// loudness step. Not safe across threads by itself: `OutputTap` holds a lock around it.
+final class LevelTap {
+    struct Reading {
+        var peak: [Float]
+        var rms: [Float]
+        var clipped: Bool
+        var momentary: Double?
+        var shortTerm: Double?
+    }
+
     private let sampleRate: Double
     private let channels: Int
     private var peaks: [Float]
@@ -284,7 +483,7 @@ final class LevelTap: @unchecked Sendable {
     private var delays: [[Float]]
     /// K-weighted energy of recent blocks, summed over channels, and how many frames each covered.
     private var blocks: [(energy: Double, frames: Int)] = []
-    private var weighted = [Float](repeating: 0, count: 8192)
+    private var weighted = [Float](repeating: 0, count: 16_384)
 
     init(sampleRate: Double, channels: Int) {
         self.sampleRate = sampleRate
@@ -296,34 +495,46 @@ final class LevelTap: @unchecked Sendable {
             vDSP_biquad_CreateSetup(sections.flatMap { $0 }, vDSP_Length(sections.count))
         }
         delays = Array(repeating: Array(repeating: 0, count: 2 * sections.count + 2), count: max(channels, 1))
+        // Blocks come a few hundred samples at a time; three seconds of them fit without growing on the audio thread.
+        blocks.reserveCapacity(4096)
     }
 
     deinit {
         setups.forEach(vDSP_biquad_DestroySetup)
     }
 
-    func measure(_ buffer: AVAudioPCMBuffer) {
-        guard let data = buffer.floatChannelData else { return }
-        let count = Int(buffer.frameLength)
+    func measure(_ buffers: UnsafeMutableAudioBufferListPointer, frames count: Int) {
+        let count = min(count, weighted.count)
         guard count > 0 else { return }
-        if weighted.count < count { weighted = [Float](repeating: 0, count: count) }
-        lock.lock()
-        defer { lock.unlock() }
         var energy = 0.0
-        for channel in 0..<min(channels, Int(buffer.format.channelCount)) {
-            let samples = data[channel]
+        for channel in 0..<channels {
+            // Each channel in a buffer of its own, or side by side in one.
+            let samples: UnsafeMutablePointer<Float>
+            let stride: Int
+            if buffers.count == 1, Int(buffers[0].mNumberChannels) > channel {
+                guard let data = buffers[0].mData?.assumingMemoryBound(to: Float.self) else { return }
+                samples = data + channel
+                stride = Int(buffers[0].mNumberChannels)
+            } else if channel < buffers.count, let data = buffers[channel].mData?.assumingMemoryBound(to: Float.self) {
+                samples = data
+                stride = 1
+            } else {
+                continue
+            }
             var peak: Float = 0
-            vDSP_maxmgv(samples, 1, &peak, vDSP_Length(count))
+            vDSP_maxmgv(samples, stride, &peak, vDSP_Length(count))
             peaks[channel] = max(peaks[channel], peak)
             if peak >= 1 { clipped = true }
             var sumOfSquares: Float = 0
-            vDSP_svesq(samples, 1, &sumOfSquares, vDSP_Length(count))
+            vDSP_svesq(samples, stride, &sumOfSquares, vDSP_Length(count))
             squares[channel] += Double(sumOfSquares)
             if channel < setups.count {
-                vDSP_biquad(setups[channel], &delays[channel], samples, 1, &weighted, 1, vDSP_Length(count))
-                var weightedSquares: Float = 0
-                vDSP_svesq(weighted, 1, &weightedSquares, vDSP_Length(count))
-                energy += Double(weightedSquares)
+                weighted.withUnsafeMutableBufferPointer { weighted in
+                    vDSP_biquad(setups[channel], &delays[channel], samples, stride, weighted.baseAddress!, 1, vDSP_Length(count))
+                    var weightedSquares: Float = 0
+                    vDSP_svesq(weighted.baseAddress!, 1, &weightedSquares, vDSP_Length(count))
+                    energy += Double(weightedSquares)
+                }
             }
         }
         frames += count
@@ -339,19 +550,19 @@ final class LevelTap: @unchecked Sendable {
     }
 
     /// The levels since the last call, which starts the next measurement afresh.
-    func take() -> (peak: [Float], rms: [Float], clipped: Bool, momentary: Double?, shortTerm: Double?) {
-        lock.lock()
+    func take() -> Reading {
         defer {
-            peaks = Array(repeating: 0, count: channels)
-            squares = Array(repeating: 0, count: channels)
+            for channel in 0..<channels {
+                peaks[channel] = 0
+                squares[channel] = 0
+            }
             frames = 0
             clipped = false
-            lock.unlock()
         }
         func decibels(_ value: Double) -> Float { Float(20 * log10(max(value, 1e-6))) }
         let peak = peaks.map { decibels(Double($0)) }
         let rms = squares.map { frames > 0 ? decibels(sqrt($0 / Double(frames))) : -120 }
-        return (peak, rms, clipped, loudness(over: 0.4), loudness(over: 3))
+        return Reading(peak: peak, rms: rms, clipped: clipped, momentary: loudness(over: 0.4), shortTerm: loudness(over: 3))
     }
 
     private func loudness(over seconds: Double) -> Double? {

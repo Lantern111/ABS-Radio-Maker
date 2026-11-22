@@ -1,5 +1,6 @@
 import Accelerate
 import AppKit
+import AVFoundation
 import Observation
 import UniformTypeIdentifiers
 
@@ -46,6 +47,39 @@ import UniformTypeIdentifiers
         }
     }
 
+    /// The channel EQ, first in line before the plug-ins. The preview hears changes at once.
+    var equalizer = EQSettings.load() {
+        didSet {
+            guard equalizer != oldValue else { return }
+            equalizer.save()
+            ChannelEQ.apply(equalizer, to: liveEQ)
+            if equalizer.scope != oldValue.scope { updateInserts() }
+            if equalizer.isActive || oldValue.isActive { scheduleProcessing(quietly: true) }
+        }
+    }
+
+    /// How long an effect kept to talk or to songs takes to fade in or out where the stretch changes, in seconds.
+    var insertTransition = Studio.loadTransition() {
+        didSet {
+            guard insertTransition != oldValue else { return }
+            UserDefaults.standard.set(insertTransition, forKey: Self.transitionKey)
+            updateEnvelope()
+            if usesScopes { scheduleProcessing(quietly: true) }
+        }
+    }
+    static let transitionChoices: [Double] = [0.2, 0.5, 1, 2, 3]
+
+    var spectrumSettings = SpectrumSettings.load() {
+        didSet {
+            guard spectrumSettings != oldValue else { return }
+            spectrumSettings.save()
+            applySpectrumSettings()
+        }
+    }
+
+    /// The EQ the preview plays through. The export gets a copy with the same settings.
+    @ObservationIgnored let liveEQ = AVAudioUnitEQ(numberOfBands: EQSettings.standardBands.count)
+
     private(set) var phase = Phase.empty
     private(set) var recordingURL: URL?
     private(set) var recordingDuration: Double = 0
@@ -69,6 +103,13 @@ import UniformTypeIdentifiers
     /// already plays them live; this brings the export and the mouth up to date. Nil when there's nothing to catch up.
     private(set) var applyingPlugins: Double?
 
+    private static let transitionKey = "insertTransition"
+
+    private static func loadTransition() -> Double {
+        let saved = UserDefaults.standard.double(forKey: transitionKey)
+        return saved > 0 ? saved : 1
+    }
+
     @ObservationIgnored private var source: SourceAudio?
     @ObservationIgnored private var detectedSegments: [ContentSegment] = []
     @ObservationIgnored private var classifiedWindows: [ClassifiedWindow] = []
@@ -87,14 +128,48 @@ import UniformTypeIdentifiers
     init() {
         let settings = StudioSettings.load()
         performance = Performance.idle(framesPerSecond: settings.framesPerSecond)
+        ChannelEQ.apply(equalizer, to: liveEQ)
+        applySpectrumSettings()
         plugins.onChange = { [weak self] in self?.pluginsChanged() }
+        updateInserts()
         plugins.restore()
     }
 
     /// The preview hears the change at once; the export and the mouth follow in the background.
     private func pluginsChanged() {
-        player.setEffects(plugins.activeUnits)
+        updateInserts()
         scheduleProcessing(quietly: true)
+    }
+
+    /// The EQ, then the plug-ins that are on, in the preview.
+    private func updateInserts() {
+        let plugged = plugins.loaded.filter(\.isOn).map { PlayerInsert(unit: $0.unit, scope: $0.scope) }
+        player.setInserts([PlayerInsert(unit: liveEQ, scope: equalizer.scope)] + plugged)
+    }
+
+    private func updateEnvelope() {
+        player.setEnvelope(ScopeEnvelope(segments: timelineSegments, transition: insertTransition))
+    }
+
+    private func applySpectrumSettings() {
+        player.spectrum.fftSize = spectrumSettings.fftSize
+        player.spectrum.smoothing = Float(spectrumSettings.smoothing)
+    }
+
+    /// Whether any effect is kept to talk or to songs, so changing where they are changes the sound.
+    var usesScopes: Bool {
+        (equalizer.isActive && equalizer.scope != .everything)
+            || plugins.loaded.contains { $0.isOn && $0.scope != .everything }
+    }
+
+    /// Changes one EQ band, kept within what the EQ can do.
+    func setBand(_ band: EQBand) {
+        guard equalizer.bands.indices.contains(band.id) else { return }
+        equalizer.bands[band.id] = band.clamped()
+    }
+
+    func resetEqualizer() {
+        equalizer.bands = EQSettings.standardBands
     }
 
     var hasRecording: Bool { processed != nil }
@@ -102,7 +177,17 @@ import UniformTypeIdentifiers
     var isBusy: Bool {
         if case .working = phase { return true }
         if applyingPlugins != nil { return true }
-        return export != nil && export?.finishedURL == nil && export?.errorMessage == nil
+        return isExporting
+    }
+
+    private var isExporting: Bool {
+        export != nil && export?.finishedURL == nil && export?.errorMessage == nil
+    }
+
+    /// Stretches can still be changed while effects catch up in the background; the catching up starts over.
+    var canEditSegments: Bool {
+        guard hasRecording, case .ready = phase else { return false }
+        return !isExporting
     }
 
     // MARK: - Opening
@@ -228,9 +313,13 @@ import UniformTypeIdentifiers
         let previewURL = previewIsCurrent
             ? preview!.url
             : FileManager.default.temporaryDirectory.appending(path: "preview-\(UUID().uuidString).wav")
-        let units = await plugins.renderCopies().map(UnitBox.init)
-        if !units.isEmpty, !quietly {
-            phase = .working(message: "플러그인을 적용하는 중…", fraction: 0)
+        let eq = equalizer
+        let eqInsert = eq.isActive ? [RenderInsert(unit: ChannelEQ.makeUnit(eq), scope: eq.scope)] : []
+        let inserts = eqInsert + (await plugins.renderCopies())
+        let segments = sourceSegments
+        let transition = insertTransition
+        if !inserts.isEmpty, !quietly {
+            phase = .working(message: "EQ와 플러그인을 적용하는 중…", fraction: 0)
         }
         let cancel = CancelFlag()
         do {
@@ -245,15 +334,19 @@ import UniformTypeIdentifiers
                     )
                 }
                 let plugged: CleanedAudio
-                if units.isEmpty {
+                if inserts.isEmpty {
                     plugged = consume cleaned
                 } else {
-                    plugged = try PluginRenderer.render(consume cleaned, through: units) { fraction in
+                    let envelope = ScopeEnvelope(
+                        segments: Self.outputSegments(segments, map: cleaned.timeMap),
+                        transition: transition
+                    )
+                    plugged = try PluginRenderer.render(consume cleaned, inserts: inserts, envelope: envelope) { fraction in
                         Task { @MainActor in
                             if quietly {
                                 self.applyingPlugins = fraction
                             } else {
-                                self.updateWorking("플러그인을 적용하는 중…", fraction)
+                                self.updateWorking("EQ와 플러그인을 적용하는 중…", fraction)
                             }
                         }
                     } isCancelled: {
@@ -280,7 +373,7 @@ import UniformTypeIdentifiers
                 if let oldPreview { player.seek(to: oldPreview) }
             }
             player.setGain(result.0.gain)
-            player.setEffects(plugins.activeUnits)
+            updateInserts()
             applyingPlugins = nil
             phase = .ready
         } catch {
@@ -341,11 +434,17 @@ import UniformTypeIdentifiers
     private func updateTimelineSegments() {
         guard let processed else {
             timelineSegments = []
+            updateEnvelope()
             return
         }
-        let map = processed.timeMap
+        timelineSegments = Self.outputSegments(sourceSegments, map: processed.timeMap)
+        updateEnvelope()
+    }
+
+    /// Stretches of the original recording, moved to the edited audio's time.
+    nonisolated static func outputSegments(_ segments: [ContentSegment], map: TimeMap) -> [ContentSegment] {
         let duration = map.outputDuration
-        timelineSegments = sourceSegments.compactMap { segment in
+        return segments.compactMap { segment in
             let start = max(map.outputTime(atSource: segment.start), 0)
             let end = min(map.outputTime(atSource: segment.end), duration)
             return end - start > 0.01 ? ContentSegment(start: start, end: end, isMusic: segment.isMusic) : nil
@@ -460,6 +559,8 @@ import UniformTypeIdentifiers
         segmentsWereEdited = edited
         timeline.selection = nil
         rebuildPerformance()
+        // Effects kept to talk or songs follow the new stretches in the export too.
+        if usesScopes { scheduleProcessing(quietly: true) }
     }
 
     // MARK: - Moving around

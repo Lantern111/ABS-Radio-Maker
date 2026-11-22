@@ -36,6 +36,8 @@ import Observation
         /// The copy that plays in the preview, and whose window is shown.
         let unit: AVAudioUnit
         var isOn = true
+        /// Which stretches it works on: everything, only talk, or only songs.
+        var scope = InsertScope.everything
 
         @ObservationIgnored fileprivate var window: NSWindow?
         @ObservationIgnored fileprivate var closeObserver: NSObjectProtocol?
@@ -57,6 +59,8 @@ import Observation
         var manufacturerCode: UInt32
         var isOn: Bool
         var state: Data?
+        /// Missing from plug-ins saved before effects could be kept to talk or songs.
+        var scope: InsertScope?
     }
 
     /// The first time this app uses another company's plug-in, macOS asks whether to allow it, and loading waits for
@@ -77,11 +81,6 @@ import Observation
     var manufacturers: [String] {
         var seen: Set<String> = []
         return available.map(\.manufacturer).filter { seen.insert($0).inserted }
-    }
-
-    /// The preview's copies of the plug-ins that are on, in order.
-    var activeUnits: [AVAudioUnit] {
-        loaded.filter(\.isOn).map(\.unit)
     }
 
     // MARK: - Finding and adding
@@ -152,6 +151,12 @@ import Observation
         changed()
     }
 
+    func setScope(_ scope: InsertScope, for plugin: Loaded) {
+        guard plugin.scope != scope else { return }
+        plugin.scope = scope
+        changed()
+    }
+
     // MARK: - Saving
 
     /// Loads the plug-ins saved last time, in order. Plug-ins that won't load are left out and named.
@@ -178,6 +183,7 @@ import Observation
                 Self.apply(entry.state, to: unit)
                 let new = Loaded(source: source, unit: unit)
                 new.isOn = entry.isOn
+                new.scope = entry.scope ?? .everything
                 loaded.append(new)
             }
             onChange()
@@ -195,7 +201,8 @@ import Observation
                 isOn: plugin.isOn,
                 state: plugin.unit.auAudioUnit.fullState.flatMap {
                     try? PropertyListSerialization.data(fromPropertyList: $0, format: .binary, options: 0)
-                }
+                },
+                scope: plugin.scope
             )
         }
         if let data = try? JSONEncoder().encode(entries) {
@@ -217,17 +224,17 @@ import Observation
 
     /// New copies of the plug-ins that are on, with the same settings, for rendering the whole recording offline. The
     /// preview's own copies keep playing meanwhile, since a plug-in can only be in one place.
-    func renderCopies() async -> [AVAudioUnit] {
-        var units: [AVAudioUnit] = []
+    func renderCopies() async -> [RenderInsert] {
+        var inserts: [RenderInsert] = []
         for plugin in loaded where plugin.isOn {
             guard let unit = await load(plugin.source) else {
                 pluginThatFailed = plugin.name
                 continue
             }
             unit.auAudioUnit.fullState = plugin.unit.auAudioUnit.fullState
-            units.append(unit)
+            inserts.append(RenderInsert(unit: unit, scope: plugin.scope))
         }
-        return units
+        return inserts
     }
 
     // MARK: - Loading
