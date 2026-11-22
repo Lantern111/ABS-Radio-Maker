@@ -40,14 +40,28 @@ struct TimeMap: Sendable {
     }
 }
 
+/// The recording after the clean-up steps, before plug-ins and before its loudness is evened out.
+struct CleanedAudio: Sendable {
+    var clip: AudioClip
+    var timeMap: TimeMap
+}
+
 struct ProcessedAudio: Sendable {
     var clip: AudioClip
     var timeMap: TimeMap
-    /// Loudness of the kept part before it was evened out, in LUFS. Nil when it's too quiet to measure.
+    /// Loudness before it was evened out, after any plug-ins, in LUFS. Nil when it's too quiet to measure.
     var loudnessBefore: Double?
+    /// How far the level was raised or lowered to reach the target, in dB. The preview plays the cleaned-up audio
+    /// through the plug-ins live, and applies this itself.
+    var gain: Double
 }
 
-/// Applies the edits in AudioEditOptions to a recording.
+/// Applies the edits in AudioEditOptions to a recording, in two steps with any plug-ins between them:
+///
+/// 1. `clean`: trim, cut rumble, shorten pauses, fade in and out.
+/// 2. `finish`: even out the loudness and keep the peaks under -1 dBFS.
+///
+/// Evening out comes after the plug-ins, so a compressor or EQ doesn't throw the loudness off its target.
 enum AudioProcessor {
     /// The frames of the original recording that the trim points keep.
     static func keptFrames(frameCount: Int, sampleRate rate: Double, options: AudioEditOptions) -> Range<Int> {
@@ -62,26 +76,30 @@ enum AudioProcessor {
         return start..<end
     }
 
-    static func process(_ source: AudioClip, options: AudioEditOptions, progress: (Double) -> Void = { _ in }) -> ProcessedAudio {
+    /// Both steps with no plug-ins between them, as the tools in Training use.
+    static func process(_ source: AudioClip, options: AudioEditOptions) -> ProcessedAudio {
         let kept = keptFrames(frameCount: source.frameCount, sampleRate: source.sampleRate, options: options)
         let trimmed = AudioClip(channels: source.channels.map { Array($0[kept]) }, sampleRate: source.sampleRate)
-        return process(trimmed: trimmed, startingAt: kept.lowerBound, options: options, progress: progress)
+        return finish(clean(trimmed: trimmed, startingAt: kept.lowerBound, options: options), options: options)
     }
 
-    static func process(_ source: SourceAudio, options: AudioEditOptions, progress: (Double) -> Void = { _ in }) -> ProcessedAudio {
+    static func process(_ source: SourceAudio, options: AudioEditOptions) -> ProcessedAudio {
+        finish(clean(source, options: options), options: options)
+    }
+
+    static func clean(_ source: SourceAudio, options: AudioEditOptions) -> CleanedAudio {
         let kept = keptFrames(frameCount: source.frameCount, sampleRate: source.sampleRate, options: options)
-        return process(trimmed: source.clip(kept), startingAt: kept.lowerBound, options: options, progress: progress)
+        return clean(trimmed: source.clip(kept), startingAt: kept.lowerBound, options: options)
     }
 
-    /// Edits audio that's already been trimmed. `start` is where it begins in the original recording, in frames.
+    /// Cleans up audio that's already been trimmed. `start` is where it begins in the original recording, in frames.
     ///
     /// The clip is consumed so its samples are edited where they are. Copying them first would hold a second copy of a
     /// whole show, over half a gigabyte, for as long as the edit takes.
-    static func process(trimmed: consuming AudioClip, startingAt start: Int, options: AudioEditOptions, progress: (Double) -> Void) -> ProcessedAudio {
+    static func clean(trimmed: consuming AudioClip, startingAt start: Int, options: AudioEditOptions) -> CleanedAudio {
         let rate = trimmed.sampleRate
         let end = start + trimmed.frameCount
         var channels = (consume trimmed).channels
-        progress(0.1)
 
         if options.removesRumble {
             let coefficients = highPassCoefficients(frequency: 80, q: 0.7071, sampleRate: rate)
@@ -89,7 +107,6 @@ enum AudioProcessor {
                 filter(&channels[index], sections: [coefficients])
             }
         }
-        progress(0.3)
 
         var pieces = [TimeMap.Piece(sourceStart: Double(start) / rate, outputStart: 0, length: Double(end - start) / rate)]
         if options.shortensSilences {
@@ -113,12 +130,22 @@ enum AudioProcessor {
                 smoothJoins(&channels, at: pieces.dropFirst().map { Int(($0.outputStart * rate).rounded()) }, sampleRate: rate)
             }
         }
-        progress(0.5)
+
+        applyFades(&channels, fadeIn: options.fadeIn, fadeOut: options.fadeOut, sampleRate: rate)
+        return CleanedAudio(clip: AudioClip(channels: channels, sampleRate: rate), timeMap: TimeMap(pieces: pieces))
+    }
+
+    /// Evens out the loudness and limits the peaks, in place.
+    static func finish(_ cleaned: consuming CleanedAudio, options: AudioEditOptions) -> ProcessedAudio {
+        let timeMap = cleaned.timeMap
+        let rate = cleaned.clip.sampleRate
+        var channels = (consume cleaned).clip.channels
 
         let before = integratedLoudness(channels, sampleRate: rate)
-        progress(0.7)
+        var gainDB = 0.0
         if options.normalizesLoudness, let before {
-            var gain = Float(pow(10, (options.targetLoudness - before) / 20))
+            gainDB = options.targetLoudness - before
+            var gain = Float(pow(10, gainDB / 20))
             for index in channels.indices {
                 channels[index].withUnsafeMutableBufferPointer { samples in
                     vDSP_vsmul(samples.baseAddress!, 1, &gain, samples.baseAddress!, 1, vDSP_Length(samples.count))
@@ -126,12 +153,7 @@ enum AudioProcessor {
             }
         }
         limit(&channels, ceiling: pow(10, -1 / 20), sampleRate: rate)
-        progress(0.9)
-
-        applyFades(&channels, fadeIn: options.fadeIn, fadeOut: options.fadeOut, sampleRate: rate)
-        progress(1)
-
-        return ProcessedAudio(clip: AudioClip(channels: channels, sampleRate: rate), timeMap: TimeMap(pieces: pieces), loudnessBefore: before)
+        return ProcessedAudio(clip: AudioClip(channels: channels, sampleRate: rate), timeMap: timeMap, loudnessBefore: before, gain: gainDB)
     }
 
     // MARK: - Filters

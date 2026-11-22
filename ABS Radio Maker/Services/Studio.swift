@@ -20,6 +20,7 @@ import UniformTypeIdentifiers
 
     let layers = LayerLibrary()
     let player = PreviewPlayer()
+    let plugins = PluginChain()
     /// What the timeline shows and what's selected in it, shared by the timeline, its buttons, and the keyboard.
     let timeline = TimelineViewport()
     /// The window's undo manager, so cutting and changing stretches can be undone with ⌘Z.
@@ -64,6 +65,9 @@ import UniformTypeIdentifiers
     var export: ExportState?
     var errorMessage: String?
     var showsShortcuts = false
+    /// How far the plug-ins have got through the recording, while they're applied again after a change. The preview
+    /// already plays them live; this brings the export and the mouth up to date. Nil when there's nothing to catch up.
+    private(set) var applyingPlugins: Double?
 
     @ObservationIgnored private var source: SourceAudio?
     @ObservationIgnored private var detectedSegments: [ContentSegment] = []
@@ -75,18 +79,29 @@ import UniformTypeIdentifiers
     @ObservationIgnored private var processingTask: Task<Void, Never>?
     @ObservationIgnored private var exportCancel = CancelFlag()
     @ObservationIgnored private var cachedSceneRenderer: (renderer: FrameRenderer, revision: Int)?
+    /// The preview's audio file: the cleaned-up recording, before plug-ins, and the options that made it.
+    @ObservationIgnored private var preview: (url: URL, options: AudioEditOptions)?
 
     static let audioTypes: [UTType] = [.audio, .wav, .mp3, .mpeg4Audio, .aiff]
 
     init() {
         let settings = StudioSettings.load()
         performance = Performance.idle(framesPerSecond: settings.framesPerSecond)
+        plugins.onChange = { [weak self] in self?.pluginsChanged() }
+        plugins.restore()
+    }
+
+    /// The preview hears the change at once; the export and the mouth follow in the background.
+    private func pluginsChanged() {
+        player.setEffects(plugins.activeUnits)
+        scheduleProcessing(quietly: true)
     }
 
     var hasRecording: Bool { processed != nil }
 
     var isBusy: Bool {
         if case .working = phase { return true }
+        if applyingPlugins != nil { return true }
         return export != nil && export?.finishedURL == nil && export?.errorMessage == nil
     }
 
@@ -103,6 +118,7 @@ import UniformTypeIdentifiers
     func open(_ url: URL) {
         processingTask?.cancel()
         player.unload()
+        removePreview()
         // Cleared first, so resetting the trim below doesn't start processing the previous recording.
         source = nil
         processed = nil
@@ -185,32 +201,71 @@ import UniformTypeIdentifiers
 
     // MARK: - Editing the sound
 
-    private func scheduleProcessing() {
+    private func scheduleProcessing(quietly: Bool = false) {
         guard let source else { return }
         processingTask?.cancel()
         processingTask = Task { [weak self] in
             // Waits a moment so dragging a slider doesn't start over on every step.
             try? await Task.sleep(for: .milliseconds(350))
             guard !Task.isCancelled else { return }
-            await self?.process(source)
+            await self?.process(source, quietly: quietly)
         }
     }
 
-    private func process(_ source: SourceAudio) async {
-        phase = .working(message: "소리를 다듬는 중…", fraction: nil)
+    /// Cleans up the recording, runs it through the plug-ins, and evens out its loudness. `quietly` keeps the preview
+    /// showing while that happens, for plug-in changes the preview already plays live.
+    private func process(_ source: SourceAudio, quietly: Bool = false) async {
+        let quietly = quietly && processed != nil
+        if quietly {
+            applyingPlugins = 0
+        } else {
+            phase = .working(message: "소리를 다듬는 중…", fraction: nil)
+        }
         let options = audioOptions
         let fps = settings.framesPerSecond
-        let previewURL = FileManager.default.temporaryDirectory.appending(path: "preview-\(UUID().uuidString).wav")
+        // The preview only needs a new file when the clean-up changed, not for plug-ins, so playback carries on.
+        let previewIsCurrent = preview?.options == options
+        let previewURL = previewIsCurrent
+            ? preview!.url
+            : FileManager.default.temporaryDirectory.appending(path: "preview-\(UUID().uuidString).wav")
+        let units = await plugins.renderCopies().map(UnitBox.init)
+        if !units.isEmpty, !quietly {
+            phase = .working(message: "플러그인을 적용하는 중…", fraction: 0)
+        }
+        let cancel = CancelFlag()
         do {
-            let result = try await Task.detached(priority: .userInitiated) {
-                let processed = AudioProcessor.process(source, options: options)
-                try Task.checkCancellation()
-                try processed.clip.write(
-                    to: previewURL,
-                    settings: AudioClip.wavSettings(sampleRate: processed.clip.sampleRate, channels: processed.clip.channels.count)
-                )
+            let result = try await withTaskCancellationHandler {
+              try await Task.detached(priority: .userInitiated) {
+                let cleaned = AudioProcessor.clean(source, options: options)
+                if cancel.isSet { throw CancellationError() }
+                if !previewIsCurrent {
+                    try cleaned.clip.write(
+                        to: previewURL,
+                        settings: AudioClip.floatSettings(sampleRate: cleaned.clip.sampleRate, channels: cleaned.clip.channels.count)
+                    )
+                }
+                let plugged: CleanedAudio
+                if units.isEmpty {
+                    plugged = consume cleaned
+                } else {
+                    plugged = try PluginRenderer.render(consume cleaned, through: units) { fraction in
+                        Task { @MainActor in
+                            if quietly {
+                                self.applyingPlugins = fraction
+                            } else {
+                                self.updateWorking("플러그인을 적용하는 중…", fraction)
+                            }
+                        }
+                    } isCancelled: {
+                        cancel.isSet
+                    }
+                }
+                let processed = AudioProcessor.finish(consume plugged, options: options)
                 return (processed, Self.makePeaks(processed.clip), Performance.voiceLevels(processed.clip, framesPerSecond: fps))
-            }.value
+              }.value
+            } onCancel: {
+                cancel.set()
+            }
             try Task.checkCancellation()
             let oldPreview = processed == nil ? nil : player.time
             processed = result.0
@@ -218,16 +273,29 @@ import UniformTypeIdentifiers
             voiceLevels = (result.2, fps)
             updateTimelineSegments()
             await buildPerformance()
-            player.load(previewURL)
-            if let oldPreview { player.seek(to: oldPreview) }
+            if !previewIsCurrent {
+                removePreview()
+                preview = (previewURL, options)
+                player.load(previewURL)
+                if let oldPreview { player.seek(to: oldPreview) }
+            }
+            player.setGain(result.0.gain)
+            player.setEffects(plugins.activeUnits)
+            applyingPlugins = nil
             phase = .ready
         } catch {
-            try? FileManager.default.removeItem(at: previewURL)
+            if !previewIsCurrent { try? FileManager.default.removeItem(at: previewURL) }
             if !(error is CancellationError) {
+                applyingPlugins = nil
                 errorMessage = error.localizedDescription
                 phase = processed == nil ? .empty : .ready
             }
         }
+    }
+
+    private func removePreview() {
+        if let preview { try? FileManager.default.removeItem(at: preview.url) }
+        preview = nil
     }
 
     nonisolated private static func makePeaks(_ clip: AudioClip) -> [Float] {

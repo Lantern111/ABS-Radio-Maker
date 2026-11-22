@@ -7,6 +7,14 @@ struct AudioPanel: View {
     var body: some View {
         Form {
             Section {
+                PluginRack(studio: studio)
+            } header: {
+                Text("플러그인과 출력 레벨")
+            } footer: {
+                Text("설치된 Audio Unit 플러그인을 다듬기 뒤, 소리 크기 맞추기 전에 순서대로 걸어요. 미리듣기에는 바로 들리고, 플러그인 창을 닫으면 영상에도 적용돼요. 로직 프로 안에만 있는 기본 플러그인(Channel EQ 등)은 다른 앱에서 쓸 수 없어요.")
+            }
+
+            Section {
                 LabeledContent("시작", value: TimeText.format(studio.audioOptions.trimStart))
                 LabeledContent("끝", value: TimeText.format(studio.audioOptions.trimEnd ?? studio.recordingDuration))
                 HStack {

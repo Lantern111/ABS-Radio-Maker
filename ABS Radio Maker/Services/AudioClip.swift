@@ -98,6 +98,19 @@ struct AudioClip: Sendable {
         ]
     }
 
+    /// 32-bit float WAV, which keeps quiet audio exact before its loudness is evened out.
+    static func floatSettings(sampleRate: Double, channels: Int) -> [String: Any] {
+        [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: sampleRate,
+            AVNumberOfChannelsKey: channels,
+            AVLinearPCMBitDepthKey: 32,
+            AVLinearPCMIsFloatKey: true,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false,
+        ]
+    }
+
     static func wavSettings(sampleRate: Double, channels: Int) -> [String: Any] {
         [
             AVFormatIDKey: kAudioFormatLinearPCM,

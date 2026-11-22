@@ -50,7 +50,7 @@ for label in ["talk", "quiet"] {
 
 let fps = 30
 func mouth(_ clip: AudioClip, talking: TalkTimeline?) -> [UInt8] {
-    let processed = ProcessedAudio(clip: clip, timeMap: TimeMap(pieces: [.init(sourceStart: 0, outputStart: 0, length: clip.duration)]), loudnessBefore: nil)
+    let processed = ProcessedAudio(clip: clip, timeMap: TimeMap(pieces: [.init(sourceStart: 0, outputStart: 0, length: clip.duration)]), loudnessBefore: nil, gain: 0)
     return Performance.make(
         audio: processed,
         voiceLevels: Performance.voiceLevels(clip, framesPerSecond: fps),
