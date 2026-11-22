@@ -4,11 +4,17 @@ import UniformTypeIdentifiers
 struct ContentView: View {
     @Bindable var studio: Studio
     @AppStorage("sidebarTab") private var tab = SidebarTab.layers
+    @AppStorage("showsChannelStrip") private var showsChannelStrip = true
     @Environment(\.undoManager) private var undoManager
     @State private var keyCommands = KeyCommands()
 
     var body: some View {
         HSplitView {
+            if showsChannelStrip {
+                ChannelStrip(studio: studio)
+                    .frame(minWidth: 140, idealWidth: 160, maxWidth: 190)
+            }
+
             VStack(spacing: 0) {
                 PreviewArea(studio: studio)
                 Divider()
@@ -37,6 +43,12 @@ struct ContentView: View {
             .frame(minWidth: 320, idealWidth: 360, maxWidth: 460)
         }
         .toolbar {
+            ToolbarItem(placement: .navigation) {
+                Button(showsChannelStrip ? "채널 스트립 숨기기" : "채널 스트립 보기", systemImage: "slider.vertical.3") {
+                    withAnimation { showsChannelStrip.toggle() }
+                }
+                .help("플러그인과 출력 레벨 (⌥⌘I)")
+            }
             ToolbarItemGroup {
                 Button("녹음 열기", systemImage: "waveform.badge.plus", action: studio.chooseRecording)
                     .help("영상으로 만들 녹음 파일을 열어요 (⌘O)")

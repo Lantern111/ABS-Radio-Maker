@@ -1,16 +1,35 @@
 import SwiftUI
 
-/// The plug-ins on the recording, in order, with the output meter beside them, like a channel strip in Logic Pro.
-struct PluginRack: View {
+/// A channel strip down the left of the window, as in Logic Pro's inspector: the plug-ins on the recording at the
+/// top, in the order the sound passes through them, and the output meter below, with the loudness at the bottom.
+struct ChannelStrip: View {
     let studio: Studio
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
+        VStack(alignment: .leading, spacing: 8) {
+            heading("플러그인")
             PluginSlots(chain: studio.plugins, applying: studio.applyingPlugins)
-                .frame(maxWidth: .infinity)
-            LevelMeter(player: studio.player, target: studio.audioOptions.normalizesLoudness ? studio.audioOptions.targetLoudness : nil)
-                .frame(width: 92)
+
+            Divider()
+                .padding(.vertical, 2)
+
+            heading("출력")
+            LevelMeter(
+                player: studio.player,
+                target: studio.audioOptions.normalizesLoudness ? studio.audioOptions.targetLoudness : nil
+            )
+            .frame(maxHeight: .infinity)
         }
+        .padding(10)
+        .frame(maxHeight: .infinity, alignment: .top)
+        .background(Color(nsColor: .underPageBackgroundColor))
+    }
+
+    private func heading(_ title: String) -> some View {
+        Text(title)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .textCase(.uppercase)
     }
 }
 
@@ -152,7 +171,7 @@ struct LevelMeter: View {
             Canvas { context, size in
                 draw(reading, in: &context, size: size)
             }
-            .frame(height: 170)
+            .frame(minHeight: 140, maxHeight: .infinity)
             .accessibilityLabel(Text("출력 레벨"))
             .accessibilityValue(Text(String(format: "왼쪽 %.0f dB, 오른쪽 %.0f dB", reading.peak[0], reading.peak[1])))
 
@@ -193,8 +212,9 @@ struct LevelMeter: View {
 
     private func draw(_ reading: MeterReading, in context: inout GraphicsContext, size: CGSize) {
         let scaleWidth: CGFloat = 22
-        let barWidth: CGFloat = 12
         let gap: CGFloat = 4
+        // Wider bars where the strip has room, up to the width of a desk meter.
+        let barWidth = min(max((size.width - scaleWidth - gap) / 2 - 12, 10), 18)
         let height = size.height
         let left = (size.width - scaleWidth - barWidth * 2 - gap) / 2
 

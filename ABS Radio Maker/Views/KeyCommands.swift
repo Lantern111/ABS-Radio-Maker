@@ -37,6 +37,9 @@ import SwiftUI
             Shortcut(keys: "⇧Z", action: "전체 보기"),
             Shortcut(keys: "⌘ + 스크롤, 핀치", action: "마우스 위치에서 확대 / 축소"),
         ]),
+        ("화면", [
+            Shortcut(keys: "⌥⌘I", action: "채널 스트립(플러그인·출력 레벨) 보기 / 숨기기"),
+        ]),
         ("파일", [
             Shortcut(keys: "⌘O", action: "녹음 열기"),
             Shortcut(keys: "⌘E", action: "영상 내보내기"),

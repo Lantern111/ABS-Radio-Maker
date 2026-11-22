@@ -4,6 +4,7 @@ import SwiftUI
 
 @main struct MyApp: App {
     @NSApplicationDelegateAdaptor private var appDelegate: AppDelegate
+    @AppStorage("showsChannelStrip") private var showsChannelStrip = true
 
     private let updaterController = SPUStandardUpdaterController(
         startingUpdater: true,
@@ -27,6 +28,13 @@ import SwiftUI
                 Button("녹음 열기…", action: studio.chooseRecording)
                     .keyboardShortcut("o")
                     .disabled(studio.isBusy)
+            }
+
+            CommandGroup(after: .sidebar) {
+                Button(showsChannelStrip ? "채널 스트립 숨기기" : "채널 스트립 보기") {
+                    showsChannelStrip.toggle()
+                }
+                .keyboardShortcut("i", modifiers: [.command, .option])
             }
 
             CommandGroup(replacing: .help) {
