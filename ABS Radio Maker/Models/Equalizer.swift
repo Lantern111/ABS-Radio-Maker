@@ -80,17 +80,24 @@ struct EQBand: Codable, Equatable, Identifiable, Sendable {
     /// How much the band raises or lowers a frequency, in dB, at a sample rate. These are the same filters Apple's EQ
     /// runs (the Audio EQ Cookbook's), so the curve on screen is the sound.
     func response(at frequency: Double, sampleRate: Double) -> Double {
-        guard isOn else { return 0 }
+        responses(at: [frequency], sampleRate: sampleRate)[0]
+    }
+
+    /// The band's effect at many frequencies, with its filter worked out once.
+    func responses(at frequencies: [Double], sampleRate: Double) -> [Double] {
+        guard isOn else { return Array(repeating: 0, count: frequencies.count) }
         let (b, a) = coefficients(sampleRate: sampleRate)
-        let w = 2 * Double.pi * frequency / sampleRate
-        let c1 = cos(w), s1 = sin(w), c2 = cos(2 * w), s2 = sin(2 * w)
-        let numeratorReal = b.0 + b.1 * c1 + b.2 * c2
-        let numeratorImaginary = -(b.1 * s1 + b.2 * s2)
-        let denominatorReal = a.0 + a.1 * c1 + a.2 * c2
-        let denominatorImaginary = -(a.1 * s1 + a.2 * s2)
-        let numerator = numeratorReal * numeratorReal + numeratorImaginary * numeratorImaginary
-        let denominator = denominatorReal * denominatorReal + denominatorImaginary * denominatorImaginary
-        return 10 * log10(max(numerator, 1e-30) / max(denominator, 1e-30))
+        return frequencies.map { frequency in
+            let w = 2 * Double.pi * frequency / sampleRate
+            let c1 = cos(w), s1 = sin(w), c2 = cos(2 * w), s2 = sin(2 * w)
+            let numeratorReal = b.0 + b.1 * c1 + b.2 * c2
+            let numeratorImaginary = -(b.1 * s1 + b.2 * s2)
+            let denominatorReal = a.0 + a.1 * c1 + a.2 * c2
+            let denominatorImaginary = -(a.1 * s1 + a.2 * s2)
+            let numerator = numeratorReal * numeratorReal + numeratorImaginary * numeratorImaginary
+            let denominator = denominatorReal * denominatorReal + denominatorImaginary * denominatorImaginary
+            return 10 * log10(max(numerator, 1e-30) / max(denominator, 1e-30))
+        }
     }
 
     private func coefficients(sampleRate: Double) -> (b: (Double, Double, Double), a: (Double, Double, Double)) {

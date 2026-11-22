@@ -92,7 +92,13 @@ struct TimelineEditor: NSViewRepresentable {
     let studio: Studio
 
     func makeNSView(context: Context) -> TimelineNSView {
-        TimelineNSView(viewport: studio.timeline)
+        let view = TimelineNSView(viewport: studio.timeline)
+        view.player = studio.player
+        return view
+    }
+
+    static func dismantleNSView(_ view: TimelineNSView, coordinator: ()) {
+        view.player = nil
     }
 
     func updateNSView(_ view: TimelineNSView, context: Context) {
@@ -122,7 +128,28 @@ struct TimelineEditor: NSViewRepresentable {
     }
 }
 
-final class TimelineNSView: NSView {
+final class TimelineNSView: NSView, PlaybackDisplay {
+    /// The playhead follows the player on the player's own clock.
+    weak var player: PreviewPlayer? {
+        didSet {
+            guard player !== oldValue else { return }
+            oldValue?.removeDisplay(self)
+            player?.addDisplay(self)
+        }
+    }
+
+    var isShowing: Bool {
+        guard let window, window.isVisible, window.occlusionState.contains(.visible) else { return false }
+        return !isHiddenOrHasHiddenAncestor
+    }
+
+    var showsSpectrum: Bool { false }
+
+    func refresh() {
+        guard let player else { return }
+        setPlayhead(player.time, isPlaying: player.isPlaying)
+    }
+
     struct ViewState: Equatable {
         var start: Double
         var pointsPerSecond: Double

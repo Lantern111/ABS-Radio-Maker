@@ -14,13 +14,41 @@ struct SceneView: NSViewRepresentable {
     }
 
     func updateNSView(_ view: SceneNSView, context: Context) {
-        // Reading the player's position here, rather than in the view around this, means only this updates as it plays.
+        // With a recording, the view follows the player on the player's own clock; this only brings in new pictures,
+        // settings, and mouth.
+        view.follow(idleTime == nil ? studio : nil)
         let time = idleTime ?? studio.player.time
         view.show(renderer: studio.sceneRenderer, pose: studio.pose(at: time), settings: studio.settings)
     }
+
+    static func dismantleNSView(_ view: SceneNSView, coordinator: ()) {
+        view.follow(nil)
+    }
 }
 
-final class SceneNSView: NSView {
+final class SceneNSView: NSView, PlaybackDisplay {
+    private weak var studio: Studio?
+
+    /// Shows what the character does at the player's position as it plays, or stops following with nil.
+    func follow(_ studio: Studio?) {
+        guard studio !== self.studio else { return }
+        self.studio?.player.removeDisplay(self)
+        self.studio = studio
+        studio?.player.addDisplay(self)
+    }
+
+    var isShowing: Bool {
+        guard let window, window.isVisible, window.occlusionState.contains(.visible) else { return false }
+        return !isHiddenOrHasHiddenAncestor
+    }
+
+    var showsSpectrum: Bool { false }
+
+    func refresh() {
+        guard let studio else { return }
+        show(renderer: studio.sceneRenderer, pose: studio.pose(at: studio.player.time), settings: studio.settings)
+    }
+
     private let canvas = CALayer()
     private let backgroundLayer = CALayer()
     private let musicBackgroundLayer = CALayer()

@@ -21,6 +21,24 @@ struct MeterReading: Equatable, Sendable {
     static let silent = MeterReading()
 }
 
+/// The numbers under and above the meter. They change a few times a second at most, so the window around them doesn't
+/// redraw with every meter frame.
+struct MeterReadouts: Equatable {
+    var highest: Float = -120
+    var clipped = false
+    var momentary: Double?
+    var shortTerm: Double?
+}
+
+/// Something on screen that follows the meter or the spectrum while the preview plays. The player refreshes it on its
+/// own clock, so it moves without SwiftUI working out the window again.
+@MainActor protocol PlaybackDisplay: AnyObject {
+    /// On screen and visible: hidden windows and windows behind others aren't refreshed.
+    var isShowing: Bool { get }
+    var showsSpectrum: Bool { get }
+    func refresh()
+}
+
 /// An effect in the preview, and the stretches it works on.
 struct PlayerInsert {
     let unit: AVAudioUnit
@@ -29,16 +47,30 @@ struct PlayerInsert {
 
 /// Plays the cleaned-up recording through the EQ and plug-ins live, then the same loudness gain the export gets and a
 /// limiter, so the preview sounds like the finished video and settings can be heard as they change. The picture and
-/// the timeline follow `time`; the meter follows `meter`; the spectrum follows `spectrum`.
+/// the timeline follow `time`. The meter and spectrum are drawn by `PlaybackDisplay`s the player refreshes itself.
 @MainActor @Observable final class PreviewPlayer {
     private(set) var isPlaying = false
     private(set) var duration: Double = 0
-    /// Where playback is, in seconds. Updated 30 times a second while playing, so anything that shows it moves along.
-    private(set) var time: Double = 0
+    /// Where playback is, in seconds. Updated 30 times a second while playing. Not observed: what shows it is a
+    /// `PlaybackDisplay`, refreshed on the player's clock and whenever playback jumps, so the rest of the window
+    /// isn't worked out again with every frame.
+    @ObservationIgnored private(set) var time: Double = 0 {
+        didSet {
+            if time != oldValue, !isTicking { refreshDisplays() }
+        }
+    }
+    @ObservationIgnored private var isTicking = false
     /// 1 is normal speed. Pressing L again while playing doubles it, up to 2.
     private(set) var rate: Float = 1
-    private(set) var meter = MeterReading.silent
-    let spectrum = SpectrumAnalyzer()
+    private(set) var readouts = MeterReadouts()
+    @ObservationIgnored private(set) var meter = MeterReading.silent
+    @ObservationIgnored let spectrum = SpectrumAnalyzer()
+    @ObservationIgnored private var displays: [WeakDisplay] = []
+    @ObservationIgnored private var ticks = 0
+
+    private struct WeakDisplay {
+        weak var display: (any PlaybackDisplay)?
+    }
 
     @ObservationIgnored private let engine = AVAudioEngine()
     @ObservationIgnored private let node = AVAudioPlayerNode()
@@ -269,6 +301,17 @@ struct PlayerInsert {
     func resetClip() {
         meter.clipped = false
         meter.highest = -120
+        updateReadouts(force: true)
+    }
+
+    func addDisplay(_ display: any PlaybackDisplay) {
+        displays.removeAll { $0.display == nil || $0.display === display }
+        displays.append(WeakDisplay(display: display))
+        display.refresh()
+    }
+
+    func removeDisplay(_ display: any PlaybackDisplay) {
+        displays.removeAll { $0.display == nil || $0.display === display }
     }
 
     // MARK: - Playing
@@ -321,13 +364,24 @@ struct PlayerInsert {
         self.clock = clock
     }
 
+    private func refreshDisplays() {
+        for display in displays.compactMap(\.display) where display.isShowing {
+            display.refresh()
+        }
+    }
+
     private func tick() {
+        isTicking = true
+        defer { isTicking = false }
         if isPlaying {
             time = min(position, duration)
             applyBlends(at: time)
         }
         updateMeter()
-        spectrum.update(from: output, sampleRate: format.sampleRate)
+        let showing = displays.compactMap(\.display).filter(\.isShowing)
+        if showing.contains(where: \.showsSpectrum) {
+            spectrum.update(from: output, sampleRate: format.sampleRate)
+        }
         // After stopping, the meter and spectrum fall back to silence, then the clock rests.
         if !isPlaying, let stoppedAt, Date().timeIntervalSince(stoppedAt) > 2 {
             clock?.invalidate()
@@ -337,7 +391,23 @@ struct PlayerInsert {
             silent.highest = meter.highest
             meter = silent
             spectrum.clear()
+            updateReadouts(force: true)
         }
+        for display in showing { display.refresh() }
+    }
+
+    /// The readouts follow the meter five times a second, and at once when the highest peak or the clip light changes.
+    private func updateReadouts(force: Bool = false) {
+        func tenths(_ value: Double?) -> Double? { value.map { ($0 * 10).rounded() / 10 } }
+        let fresh = MeterReadouts(
+            highest: (meter.highest * 10).rounded() / 10,
+            clipped: meter.clipped,
+            momentary: tenths(meter.momentary),
+            shortTerm: tenths(meter.shortTerm)
+        )
+        guard fresh != readouts else { return }
+        let urgent = fresh.highest != readouts.highest || fresh.clipped != readouts.clipped
+        if force || urgent || ticks % 6 == 0 { readouts = fresh }
     }
 
     private func updateMeter() {
@@ -361,7 +431,9 @@ struct PlayerInsert {
         if fresh.clipped { reading.clipped = true }
         reading.momentary = fresh.momentary
         reading.shortTerm = fresh.shortTerm
-        if reading != meter { meter = reading }
+        meter = reading
+        ticks += 1
+        updateReadouts()
     }
 }
 

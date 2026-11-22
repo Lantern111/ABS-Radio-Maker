@@ -198,18 +198,14 @@ struct LevelMeter: View {
     /// The loudness the export aims for, marked beside the readouts.
     let target: Double?
 
-    /// Evenly spaced up the meter, as on Logic Pro's: 3 dB apart near the top, wider apart further down.
-    private static let marks: [Float] = [6, 3, 0, -3, -6, -9, -12, -15, -18, -21, -24, -30, -35, -40, -45, -50, -60]
-    private static let lowest: Float = -60
-
     var body: some View {
-        let reading = player.meter
+        let readouts = player.readouts
         VStack(spacing: 6) {
             Button {
                 player.resetClip()
             } label: {
-                let over = reading.clipped || reading.highest > 0
-                Text(reading.highest > -100 ? String(format: "%.1f", reading.highest) : "–")
+                let over = readouts.clipped || readouts.highest > 0
+                Text(readouts.highest > -100 ? String(format: "%.1f", readouts.highest) : "–")
                     .font(.system(size: 10, weight: .semibold).monospacedDigit())
                     .foregroundStyle(over ? Color.white : Color.primary)
                     .frame(maxWidth: .infinity)
@@ -219,16 +215,13 @@ struct LevelMeter: View {
             .buttonStyle(.plain)
             .help("지금까지 가장 컸던 순간 (dBFS). 0을 넘으면 빨갛게 켜져요. 클릭하면 지워져요.")
 
-            Canvas { context, size in
-                draw(reading, in: &context, size: size)
-            }
-            .frame(minHeight: 140, maxHeight: .infinity)
-            .accessibilityLabel(Text("출력 레벨"))
-            .accessibilityValue(Text(String(format: "왼쪽 %.0f dB, 오른쪽 %.0f dB", reading.peak[0], reading.peak[1])))
+            MeterBars(player: player)
+                .frame(minHeight: 140, maxHeight: .infinity)
+                .accessibilityLabel(Text("출력 레벨"))
 
             VStack(spacing: 2) {
-                loudness("순간", reading.momentary)
-                loudness("3초", reading.shortTerm)
+                loudness("순간", readouts.momentary)
+                loudness("3초", readouts.shortTerm)
                 if let target {
                     Text(String(format: "목표 %.0f LUFS", target))
                         .font(.system(size: 9))
@@ -256,9 +249,101 @@ struct LevelMeter: View {
         let off = abs(value - target)
         return off <= 2 ? .green : off <= 5 ? .yellow : .red
     }
+}
+
+private struct MeterBars: NSViewRepresentable {
+    let player: PreviewPlayer
+
+    func makeNSView(context: Context) -> MeterNSView {
+        let view = MeterNSView()
+        view.player = player
+        return view
+    }
+
+    func updateNSView(_ view: MeterNSView, context: Context) {
+        view.player = player
+    }
+
+    static func dismantleNSView(_ view: MeterNSView, coordinator: ()) {
+        view.player = nil
+    }
+}
+
+/// The meter's bars, as Core Animation layers: each frame only moves a few rectangles. The scale is made once for
+/// a size.
+final class MeterNSView: NSView, PlaybackDisplay {
+    weak var player: PreviewPlayer? {
+        didSet {
+            guard player !== oldValue else { return }
+            oldValue?.removeDisplay(self)
+            if window != nil { player?.addDisplay(self) }
+        }
+    }
+
+    /// Evenly spaced up the meter, as on Logic Pro's: 3 dB apart near the top, wider apart further down.
+    private static let marks: [Float] = [6, 3, 0, -3, -6, -9, -12, -15, -18, -21, -24, -30, -35, -40, -45, -50, -60]
+    private static let lowest: Float = -60
+
+    private struct Channel {
+        let track = CALayer()
+        let over = CALayer()
+        let zones = CAGradientLayer()
+        let reach = CALayer()
+        let average = CALayer()
+        let hold = CALayer()
+    }
+
+    private let channels = [Channel(), Channel()]
+    private let scale = CALayer()
+    private let zero = CALayer()
+    private var bars: [CGRect] = []
+
+    init() {
+        super.init(frame: .zero)
+        wantsLayer = true
+        for channel in channels {
+            channel.track.cornerRadius = 2
+            channel.over.backgroundColor = NSColor.systemRed.withAlphaComponent(0.08).cgColor
+            channel.reach.backgroundColor = NSColor.black.cgColor
+            channel.zones.mask = channel.reach
+            channel.zones.opacity = 0.85
+            channel.average.backgroundColor = NSColor(white: 1, alpha: 0.55).cgColor
+            for layer in [channel.track, channel.over, channel.zones, channel.average, channel.hold] {
+                self.layer?.addSublayer(layer)
+            }
+        }
+        self.layer?.addSublayer(zero)
+        self.layer?.addSublayer(scale)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    var isShowing: Bool {
+        guard let window, window.isVisible, window.occlusionState.contains(.visible) else { return false }
+        return !isHiddenOrHasHiddenAncestor && bounds.height > 0
+    }
+
+    var showsSpectrum: Bool { false }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window != nil { player?.addDisplay(self) } else { player?.removeDisplay(self) }
+        needsLayout = true
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsLayout = true
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        needsLayout = true
+    }
 
     /// From 0 at the bottom to 1 at the top, straight between neighbouring marks.
-    private func position(of decibels: Float) -> CGFloat {
+    private static func position(of decibels: Float) -> CGFloat {
         let marks = Self.marks
         if decibels >= marks[0] { return 1 }
         if decibels <= Self.lowest { return 0 }
@@ -272,64 +357,80 @@ struct LevelMeter: View {
         return 0
     }
 
-    private func draw(_ reading: MeterReading, in context: inout GraphicsContext, size: CGSize) {
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+
+        var colors: (primary: CGColor, secondary: CGColor, track: CGColor) = (NSColor.labelColor.cgColor, NSColor.secondaryLabelColor.cgColor, NSColor.secondaryLabelColor.cgColor)
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            colors = (NSColor.labelColor.cgColor, NSColor.secondaryLabelColor.cgColor, NSColor.secondaryLabelColor.withAlphaComponent(0.15).cgColor)
+        }
+        let size = bounds.size
         let scaleWidth: CGFloat = 22
         let gap: CGFloat = 4
         // Wider bars where the strip has room, up to the width of a desk meter.
         let barWidth = min(max((size.width - scaleWidth - gap) / 2 - 12, 10), 18)
-        let height = size.height
         let left = (size.width - scaleWidth - barWidth * 2 - gap) / 2
         let barsLeft = left + scaleWidth
-        let barsRight = barsLeft + barWidth * 2 + gap
+        let height = size.height
+        let zeroY = Self.position(of: 0) * height
+        bars = (0..<2).map { CGRect(x: barsLeft + CGFloat($0) * (barWidth + gap), y: 0, width: barWidth, height: height) }
 
-        // Scale, every mark where there's room, every other one where there isn't.
+        // Green, yellow over the last 6 dB, red past full scale, as hard bands up the bar.
+        let six = NSNumber(value: Double(Self.position(of: -6)))
+        let full = NSNumber(value: Double(Self.position(of: 0)))
+        for (channel, bar) in zip(channels, bars) {
+            channel.track.frame = bar
+            channel.track.backgroundColor = colors.track
+            channel.over.frame = CGRect(x: bar.minX, y: zeroY, width: bar.width, height: height - zeroY)
+            channel.zones.frame = bar
+            channel.zones.colors = [NSColor.systemGreen, .systemGreen, .systemYellow, .systemYellow, .systemRed, .systemRed].map(\.cgColor)
+            channel.zones.locations = [0, six, six, full, full, 1]
+            channel.zones.startPoint = CGPoint(x: 0.5, y: 0)
+            channel.zones.endPoint = CGPoint(x: 0.5, y: 1)
+            channel.hold.backgroundColor = colors.primary
+        }
+        zero.frame = CGRect(x: barsLeft - 1, y: zeroY - 0.5, width: barWidth * 2 + gap + 2, height: 1)
+        zero.backgroundColor = NSColor.labelColor.withAlphaComponent(0.6).cgColor
+
+        // The scale: every mark where there's room, every other one where there isn't.
         let spacing = height / CGFloat(Self.marks.count - 1)
-        for (index, mark) in Self.marks.enumerated() {
-            guard spacing >= 10 || index % 2 == 0 || mark == 0 else { continue }
-            let y = height - position(of: mark) * height
-            let label = context.resolve(
-                Text(verbatim: mark > 0 ? "+\(Int(mark))" : "\(Int(mark))")
-                    .font(.system(size: 8, weight: mark == 0 ? .bold : .regular).monospacedDigit())
-                    .foregroundStyle(mark == 0 ? Color.primary : Color.secondary)
-            )
-            context.draw(label, at: CGPoint(x: barsLeft - 4, y: min(max(y, 5), height - 5)), anchor: .trailing)
+        let contentsScale = window?.backingScaleFactor ?? 2
+        scale.sublayers = Self.marks.enumerated().compactMap { index, mark in
+            guard spacing >= 10 || index % 2 == 0 || mark == 0 else { return nil }
+            let label = CATextLayer()
+            label.string = mark > 0 ? "+\(Int(mark))" : "\(Int(mark))"
+            label.font = NSFont.monospacedDigitSystemFont(ofSize: 8, weight: mark == 0 ? .bold : .regular)
+            label.fontSize = 8
+            label.foregroundColor = mark == 0 ? colors.primary : colors.secondary
+            label.alignmentMode = .right
+            label.contentsScale = contentsScale
+            let y = min(max(Self.position(of: mark) * height, 5), height - 5)
+            label.frame = CGRect(x: 0, y: y - 5.5, width: barsLeft - 4, height: 11)
+            return label
         }
+        refresh()
+    }
 
-        let zero = height - position(of: 0) * height
-        for channel in 0..<2 {
-            let x = barsLeft + CGFloat(channel) * (barWidth + gap)
-            let track = CGRect(x: x, y: 0, width: barWidth, height: height)
-            context.fill(Path(roundedRect: track, cornerRadius: 2), with: .color(.secondary.opacity(0.15)))
-            // Above full scale, faintly red even when nothing is there, so it reads as the place not to go.
-            context.fill(Path(CGRect(x: x, y: 0, width: barWidth, height: zero)), with: .color(.red.opacity(0.08)))
-
-            // Peak, coloured by zone: green, yellow over the last 6 dB, red past full scale.
-            let peakHeight = position(of: reading.peak[channel]) * height
-            let zones: [(from: Float, to: Float, color: Color)] = [(-60, -6, .green), (-6, 0, .yellow), (0, 6, .red)]
-            for zone in zones {
-                let bottom = position(of: zone.from) * height
-                let top = min(position(of: zone.to) * height, peakHeight)
-                guard top > bottom else { continue }
-                context.fill(
-                    Path(CGRect(x: x, y: height - top, width: barWidth, height: top - bottom)),
-                    with: .color(zone.color.opacity(0.85))
-                )
-            }
-            // Average level, as a brighter core.
-            let rmsHeight = position(of: reading.rms[channel]) * height
-            if rmsHeight > 0 {
-                context.fill(
-                    Path(CGRect(x: x + barWidth * 0.3, y: height - rmsHeight, width: barWidth * 0.4, height: rmsHeight)),
-                    with: .color(.white.opacity(0.55))
-                )
-            }
-            // The loudest lately.
-            if reading.hold[channel] > Self.lowest {
-                let y = height - position(of: reading.hold[channel]) * height
-                context.fill(Path(CGRect(x: x, y: y - 1, width: barWidth, height: 2)), with: .color(.primary))
+    func refresh() {
+        guard bars.count == 2 else { return }
+        let reading = player?.meter ?? .silent
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+        for (index, channel) in channels.enumerated() {
+            let bar = bars[index]
+            channel.reach.frame = CGRect(x: 0, y: 0, width: bar.width, height: Self.position(of: reading.peak[index]) * bar.height)
+            let average = Self.position(of: reading.rms[index]) * bar.height
+            channel.average.frame = CGRect(x: bar.minX + bar.width * 0.3, y: 0, width: bar.width * 0.4, height: average)
+            if reading.hold[index] > Self.lowest {
+                channel.hold.isHidden = false
+                channel.hold.frame = CGRect(x: bar.minX, y: Self.position(of: reading.hold[index]) * bar.height - 1, width: bar.width, height: 2)
+            } else {
+                channel.hold.isHidden = true
             }
         }
-        // Full scale, across both bars.
-        context.fill(Path(CGRect(x: barsLeft - 1, y: zero - 0.5, width: barsRight - barsLeft + 2, height: 1)), with: .color(.primary.opacity(0.6)))
     }
 }

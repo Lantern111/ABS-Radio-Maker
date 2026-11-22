@@ -117,7 +117,11 @@ enum PluginRenderer {
         }
         engine.connect(nodes.last!, to: engine.mainMixerNode, format: format)
         try engine.start()
-        defer { engine.stop() }
+        defer {
+            engine.stop()
+            // The plug-ins are kept for the next render, so they're let go of here.
+            chain.forEach(engine.detach)
+        }
 
         // Some plug-ins hold the sound back, like a limiter looking ahead. Their delay is rendered past the end and
         // dropped from the start, so the sound stays in step with the picture.

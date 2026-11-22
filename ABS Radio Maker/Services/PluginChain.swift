@@ -73,6 +73,9 @@ import Observation
     private(set) var isLoading = false
     /// The name of a plug-in that wouldn't load, to say so instead of quietly doing nothing.
     var pluginThatFailed: String?
+    /// The offline copies, kept between renders: loading another company's plug-in takes a while, and settings
+    /// change far more often than the list does.
+    @ObservationIgnored private var renderUnits: [UUID: AVAudioUnit] = [:]
 
     /// Called when what the chain does to the sound may have changed: a plug-in added, removed, moved, switched, or
     /// its window closed after changing settings.
@@ -224,14 +227,22 @@ import Observation
 
     /// New copies of the plug-ins that are on, with the same settings, for rendering the whole recording offline. The
     /// preview's own copies keep playing meanwhile, since a plug-in can only be in one place.
+    /// Only one render uses them at a time: a new render waits for the one it replaces to stop.
     func renderCopies() async -> [RenderInsert] {
+        renderUnits = renderUnits.filter { id, _ in loaded.contains { $0.id == id } }
         var inserts: [RenderInsert] = []
         for plugin in loaded where plugin.isOn {
-            guard let unit = await load(plugin.source) else {
+            var copy = renderUnits[plugin.id]
+            if copy == nil {
+                copy = await load(plugin.source)
+                renderUnits[plugin.id] = copy
+            }
+            guard let unit = copy else {
                 pluginThatFailed = plugin.name
                 continue
             }
             unit.auAudioUnit.fullState = plugin.unit.auAudioUnit.fullState
+            unit.reset()
             inserts.append(RenderInsert(unit: unit, scope: plugin.scope))
         }
         return inserts

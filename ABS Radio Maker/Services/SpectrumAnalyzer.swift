@@ -1,40 +1,35 @@
 import Accelerate
-import Observation
 
-/// The preview's spectrum, worked out 30 times a second from the latest stretch of sound while anything shows it.
-/// Levels are per FFT bin, in dB where a full-scale sine wave reads 0.
-@MainActor @Observable final class SpectrumAnalyzer {
+/// The preview's spectrum, worked out on the player's clock from the latest stretch of sound, only while a spectrum is
+/// on screen. Levels are per FFT bin, in dB where a full-scale sine wave reads 0. Displays read them when the player
+/// asks them to refresh, so nothing else in the window redraws along with them.
+@MainActor final class SpectrumAnalyzer {
     private(set) var levels: [Float] = []
     /// Hz between neighbouring bins.
     private(set) var binWidth: Double = 0
 
-    /// How many views show the spectrum. Nothing is worked out while none do.
-    @ObservationIgnored var watchers = 0
-    @ObservationIgnored var fftSize = 4096 {
+    var fftSize = 4096 {
         didSet {
             guard fftSize != oldValue else { return }
             levels = []
-            smoothed = []
         }
     }
     /// 0 follows every change, near 1 moves slowly.
-    @ObservationIgnored var smoothing: Float = 0.75
+    var smoothing: Float = 0.75
 
     static let silence: Float = -140
 
-    @ObservationIgnored private var setup: vDSP_DFT_Setup?
-    @ObservationIgnored private var setupSize = 0
-    @ObservationIgnored private var window: [Float] = []
-    @ObservationIgnored private var samples: [Float] = []
-    @ObservationIgnored private var real: [Float] = []
-    @ObservationIgnored private var imaginary: [Float] = []
-    @ObservationIgnored private var outReal: [Float] = []
-    @ObservationIgnored private var outImaginary: [Float] = []
-    @ObservationIgnored private var fresh: [Float] = []
-    @ObservationIgnored private var smoothed: [Float] = []
+    private var setup: vDSP_DFT_Setup?
+    private var setupSize = 0
+    private var window: [Float] = []
+    private var samples: [Float] = []
+    private var real: [Float] = []
+    private var imaginary: [Float] = []
+    private var outReal: [Float] = []
+    private var outImaginary: [Float] = []
+    private var fresh: [Float] = []
 
     func update(from tap: OutputTap, sampleRate: Double) {
-        guard watchers > 0 else { return }
         prepare()
         let size = setupSize
         let half = size / 2
@@ -79,25 +74,27 @@ import Observation
         // The first bin holds the steady offset and the highest frequency together, neither of which is shown.
         fresh[0] = Self.silence
 
-        if smoothed.count != half {
-            smoothed = fresh
-        } else {
-            // Rises come through faster than falls, as on a desk analyzer.
-            let fall = 1 - min(max(smoothing, 0), 0.99)
-            let rise = min(1, fall * 3)
-            for index in 0..<half {
-                let old = smoothed[index]
-                let new = fresh[index]
-                smoothed[index] = max(old + (new - old) * (new > old ? rise : fall), Self.silence)
+        binWidth = sampleRate / Double(size)
+        guard levels.count == half else {
+            levels = fresh
+            return
+        }
+        // Rises come through faster than falls, as on a desk analyzer.
+        let fall = 1 - min(max(smoothing, 0), 0.99)
+        let rise = min(1, fall * 3)
+        levels.withUnsafeMutableBufferPointer { levels in
+            fresh.withUnsafeBufferPointer { fresh in
+                for index in 0..<half {
+                    let old = levels[index]
+                    let new = fresh[index]
+                    levels[index] = max(old + (new - old) * (new > old ? rise : fall), Self.silence)
+                }
             }
         }
-        binWidth = sampleRate / Double(size)
-        levels = smoothed
     }
 
     func clear() {
-        smoothed = []
-        if !levels.isEmpty { levels = [] }
+        levels = []
     }
 
     private func prepare() {
@@ -114,6 +111,6 @@ import Observation
         outReal = real
         outImaginary = real
         fresh = real
-        smoothed = []
+        levels = []
     }
 }

@@ -288,10 +288,14 @@ import UniformTypeIdentifiers
 
     private func scheduleProcessing(quietly: Bool = false) {
         guard let source else { return }
-        processingTask?.cancel()
+        let previous = processingTask
+        previous?.cancel()
         processingTask = Task { [weak self] in
-            // Waits a moment so dragging a slider doesn't start over on every step.
-            try? await Task.sleep(for: .milliseconds(350))
+            // Waits a moment so dragging a slider or an EQ point doesn't start over on every step. Effects the
+            // preview already plays live wait a little longer.
+            try? await Task.sleep(for: .milliseconds(quietly ? 800 : 350))
+            // The render being replaced lets go of the plug-in copies first, since they're shared.
+            await previous?.value
             guard !Task.isCancelled else { return }
             await self?.process(source, quietly: quietly)
         }
@@ -310,6 +314,9 @@ import UniformTypeIdentifiers
         let fps = settings.framesPerSecond
         // The preview only needs a new file when the clean-up changed, not for plug-ins, so playback carries on.
         let previewIsCurrent = preview?.options == options
+        // When only the effects changed, the timing is the same, so the mouth worked out before still fits. It
+        // follows the voice, which the effects barely move.
+        let keepsMouth = quietly && previewIsCurrent && voiceLevels?.framesPerSecond == fps
         let previewURL = previewIsCurrent
             ? preview!.url
             : FileManager.default.temporaryDirectory.appending(path: "preview-\(UUID().uuidString).wav")
@@ -324,7 +331,8 @@ import UniformTypeIdentifiers
         let cancel = CancelFlag()
         do {
             let result = try await withTaskCancellationHandler {
-              try await Task.detached(priority: .userInitiated) {
+              // Catching up in the background mustn't take time from the picture and the meters.
+              try await Task.detached(priority: quietly ? .utility : .userInitiated) {
                 let cleaned = AudioProcessor.clean(source, options: options)
                 if cancel.isSet { throw CancellationError() }
                 if !previewIsCurrent {
@@ -354,7 +362,8 @@ import UniformTypeIdentifiers
                     }
                 }
                 let processed = AudioProcessor.finish(consume plugged, options: options)
-                return (processed, Self.makePeaks(processed.clip), Performance.voiceLevels(processed.clip, framesPerSecond: fps))
+                let levels = keepsMouth ? nil : Performance.voiceLevels(processed.clip, framesPerSecond: fps)
+                return (processed, Self.makePeaks(processed.clip), levels)
               }.value
             } onCancel: {
                 cancel.set()
@@ -363,9 +372,11 @@ import UniformTypeIdentifiers
             let oldPreview = processed == nil ? nil : player.time
             processed = result.0
             peaks = result.1
-            voiceLevels = (result.2, fps)
             updateTimelineSegments()
-            await buildPerformance()
+            if let levels = result.2 {
+                voiceLevels = (levels, fps)
+                await buildPerformance()
+            }
             if !previewIsCurrent {
                 removePreview()
                 preview = (previewURL, options)

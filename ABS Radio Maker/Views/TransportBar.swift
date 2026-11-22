@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// Play and pause, the time, the editing tools, zoom, and the timeline of talk and songs.
@@ -73,15 +74,15 @@ struct TransportBar: View {
     }
 }
 
-/// Reads the playback position on its own, so only this updates 30 times a second while playing.
+/// The playback position and length. The position is drawn by a layer the player refreshes itself, in a space of its
+/// own, so it changing 30 times a second doesn't make the window lay itself out again.
 private struct PlaybackTime: View {
     let player: PreviewPlayer
 
     var body: some View {
         HStack(spacing: 6) {
-            Text("\(TimeText.format(player.time, precise: true)) / \(TimeText.format(player.duration))")
-                .monospacedDigit()
-                .foregroundStyle(.secondary)
+            TimeReadout(player: player)
+                .frame(width: TimeReadoutView.width(for: player.duration), height: 16)
             if player.isPlaying, player.rate != 1 {
                 Text("\(Int(player.rate))×")
                     .font(.caption.weight(.semibold))
@@ -148,6 +149,90 @@ private struct Legend: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
+    }
+}
+
+private struct TimeReadout: NSViewRepresentable {
+    let player: PreviewPlayer
+
+    func makeNSView(context: Context) -> TimeReadoutView {
+        let view = TimeReadoutView()
+        view.player = player
+        return view
+    }
+
+    func updateNSView(_ view: TimeReadoutView, context: Context) {
+        view.player = player
+        view.refresh()
+    }
+
+    static func dismantleNSView(_ view: TimeReadoutView, coordinator: ()) {
+        view.player = nil
+    }
+}
+
+final class TimeReadoutView: NSView, PlaybackDisplay {
+    weak var player: PreviewPlayer? {
+        didSet {
+            guard player !== oldValue else { return }
+            oldValue?.removeDisplay(self)
+            player?.addDisplay(self)
+        }
+    }
+    private let text = CATextLayer()
+    private static let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+
+    /// Room for the longest the readout gets for a recording of this length.
+    static func width(for duration: Double) -> CGFloat {
+        let sample = "\(TimeText.format(duration, precise: true)) / \(TimeText.format(duration))"
+        return ceil((sample as NSString).size(withAttributes: [.font: font]).width) + 4
+    }
+
+    init() {
+        super.init(frame: .zero)
+        wantsLayer = true
+        text.font = Self.font
+        text.fontSize = Self.font.pointSize
+        text.alignmentMode = .left
+        layer?.addSublayer(text)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    var isShowing: Bool {
+        guard let window, window.isVisible, window.occlusionState.contains(.visible) else { return false }
+        return !isHiddenOrHasHiddenAncestor
+    }
+
+    var showsSpectrum: Bool { false }
+
+    override func layout() {
+        super.layout()
+        text.frame = bounds
+        text.contentsScale = window?.backingScaleFactor ?? 2
+        updateColor()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateColor()
+    }
+
+    private func updateColor() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            text.foregroundColor = NSColor.secondaryLabelColor.cgColor
+        }
+    }
+
+    func refresh() {
+        guard let player else { return }
+        let string = "\(TimeText.format(player.time, precise: true)) / \(TimeText.format(player.duration))"
+        guard (text.string as? String) != string else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        text.string = string
+        CATransaction.commit()
     }
 }
 
