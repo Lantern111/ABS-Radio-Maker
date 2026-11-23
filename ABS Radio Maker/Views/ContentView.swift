@@ -91,6 +91,11 @@ struct ContentView: View {
             isPresented: Binding(get: { studio.errorMessage != nil }, set: { if !$0 { studio.errorMessage = nil } })
         ) {
             Button("확인") {}
+            if Feedback.isAvailable {
+                Button("버그 신고…") { [message = studio.errorMessage ?? ""] in
+                    Feedback.open(.bug, details: "오류: \(message)")
+                }
+            }
         } message: {
             Text(studio.errorMessage ?? "")
         }

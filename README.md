@@ -80,9 +80,13 @@ You only need to do this once. The first time you add a plug-in, macOS also asks
 
 Automatic updates are on by default: new versions download in the background and install when you quit the app. You can turn this off in Settings. You can also choose **Check for Updates…** in the ABS Radio Maker menu at any time.
 
+### Reporting a Bug or Suggesting a Change
+
+Choose **Help > 버그 신고…** (Report a Bug) or **Help > 개선 요청…** (Suggest a Change) in the app. The form opens with your app version, macOS version, and kind of Mac already filled in. When something goes wrong, the error window has a **버그 신고…** button that adds the error message too. If the app doesn't open, use [this form](https://docs.google.com/forms/d/e/1FAIpQLSfnS4qldQEQKCwgX6OgdzREBJTIimu18BUjIGCUmZALqMWelw/viewform). You don't need an account.
+
 ### Privacy
 
-ABS Radio Maker only reads the recordings you open, and it doesn't change them or send them anywhere. Everything, including finding songs and talk, happens on your Mac. It has no accounts or analytics, and it uses the internet only to check for and download updates.
+ABS Radio Maker only reads the recordings you open, and it doesn't change them or send them anywhere. Everything, including finding songs and talk, happens on your Mac. It has no accounts or analytics, and it uses the internet only to check for and download updates. A report is sent only when you submit one yourself.
 
 ### Uninstalling
 
@@ -155,9 +159,13 @@ ABS Radio Maker는 아직 Apple의 유료 개발자 인증을 받지 않아 처�
 
 자동 업데이트는 기본으로 켜져 있습니다. 새 버전을 내려받아 두었다가 앱을 종료할 때 설치합니다. 설정에서 끌 수 있고, ABS Radio Maker 메뉴의 **업데이트 확인…**으로 직접 확인할 수도 있습니다.
 
+### 버그 신고와 개선 요청
+
+앱에서 **도움말 → 버그 신고…** 또는 **도움말 → 개선 요청…**을 눌러 주세요. 앱 버전, macOS 버전, Mac 종류가 미리 채워진 양식이 열립니다. 오류 창이 뜨면 그 창의 **버그 신고…** 버튼을 눌러도 되고, 이때는 오류 내용도 함께 채워집니다. 앱이 열리지 않는다면 [이 양식](https://docs.google.com/forms/d/e/1FAIpQLSfnS4qldQEQKCwgX6OgdzREBJTIimu18BUjIGCUmZALqMWelw/viewform)을 이용해 주세요. 계정은 필요 없습니다.
+
 ### 개인정보
 
-ABS Radio Maker는 여는 녹음 파일을 읽기만 하고, 바꾸거나 어디로 보내지 않습니다. 노래와 말하기를 찾는 일을 포함해 모든 처리는 Mac 안에서 합니다. 계정이나 사용 통계 수집이 없고, 인터넷은 업데이트를 확인하고 받을 때만 사용합니다.
+ABS Radio Maker는 여는 녹음 파일을 읽기만 하고, 바꾸거나 어디로 보내지 않습니다. 노래와 말하기를 찾는 일을 포함해 모든 처리는 Mac 안에서 합니다. 계정이나 사용 통계 수집이 없고, 인터넷은 업데이트를 확인하고 받을 때만 사용합니다. 제보는 직접 보내실 때만 전달됩니다.
 
 ### 앱 지우기
 
@@ -170,6 +178,7 @@ Requires Xcode 27.2 or later. Open `ABS Radio Maker.xcodeproj` and run the app. 
 Xcode 27.2 이상이 필요합니다. `ABS Radio Maker.xcodeproj`를 열고 실행하면 됩니다. 업데이트에 쓰는 [Sparkle](https://sparkle-project.org)은 Xcode가 알아서 내려받습니다.
 
 - `Scripts/make-release.sh` builds the disk image and `appcast.xml` in `dist/`. It needs the update signing key in your Keychain.
+- `Scripts/feedback-form.gs` creates the bug report and suggestion form with Google Apps Script.
 - `Training` has the tools that train the talk detector. See [Training/README.md](Training/README.md).
 
 ## Copyright / 저작권

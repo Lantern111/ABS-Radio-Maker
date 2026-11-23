@@ -28,6 +28,9 @@ struct ExportSheet: View {
                     Text(message)
                         .fixedSize(horizontal: false, vertical: true)
                     HStack {
+                        if Feedback.isAvailable {
+                            Button("버그 신고…") { Feedback.open(.bug, details: "내보내기 중 오류: \(message)") }
+                        }
                         Spacer()
                         Button("닫기") { studio.export = nil }
                             .keyboardShortcut(.defaultAction)

@@ -41,6 +41,11 @@ import SwiftUI
             CommandGroup(replacing: .help) {
                 Button("키보드 단축키") { studio.showsShortcuts = true }
                     .keyboardShortcut("k", modifiers: [.command, .option])
+                Divider()
+                Button("버그 신고…") { Feedback.open(.bug) }
+                    .disabled(!Feedback.isAvailable)
+                Button("개선 요청…") { Feedback.open(.suggestion) }
+                    .disabled(!Feedback.isAvailable)
             }
 
             CommandGroup(after: .saveItem) {
