@@ -69,10 +69,10 @@ final class SpectrumNSView: NSView, PlaybackDisplay {
     private let gridLayer = CAShapeLayer()
     private let zeroLayer = CAShapeLayer()
     private let labelsLayer = CALayer()
-    private let barsGradient = CAGradientLayer()
-    private let barsMask = CAShapeLayer()
-    private let fillGradient = CAGradientLayer()
-    private let fillMask = CAShapeLayer()
+    /// Plain layers, no masks: a mask makes the window server draw the layer twice every frame.
+    private let barsLayer = CALayer()
+    private var bars: [CALayer] = []
+    private let fillLayer = CAShapeLayer()
     private let lineLayer = CAShapeLayer()
     private let curveFill = CAShapeLayer()
     private let curveLayer = CAShapeLayer()
@@ -115,16 +115,8 @@ final class SpectrumNSView: NSView, PlaybackDisplay {
         zeroLayer.strokeColor = NSColor(white: 1, alpha: editsBands ? 0.22 : 0.12).cgColor
         zeroLayer.lineWidth = 1
 
-        // Red at the low end through to violet at the top, like MiniMeters' colour bars.
-        barsGradient.colors = stride(from: 0.0, through: 0.78, by: 0.13).map {
-            NSColor(hue: $0, saturation: 0.72, brightness: 0.95, alpha: 1).cgColor
-        }
-        barsGradient.startPoint = CGPoint(x: 0, y: 0.5)
-        barsGradient.endPoint = CGPoint(x: 1, y: 0.5)
-        barsGradient.mask = barsMask
-
-        fillGradient.colors = [Self.lineColor.withAlphaComponent(0.04).cgColor, Self.lineColor.withAlphaComponent(0.35).cgColor]
-        fillGradient.mask = fillMask
+        fillLayer.fillColor = Self.lineColor.withAlphaComponent(0.16).cgColor
+        fillLayer.strokeColor = nil
 
         lineLayer.fillColor = nil
         lineLayer.lineWidth = 1.2
@@ -136,7 +128,7 @@ final class SpectrumNSView: NSView, PlaybackDisplay {
         singleCurve.fillColor = nil
         singleCurve.lineWidth = 1
 
-        for layer in [gridLayer, zeroLayer, labelsLayer, barsGradient, fillGradient, lineLayer, curveFill, singleCurve, curveLayer] {
+        for layer in [gridLayer, zeroLayer, labelsLayer, barsLayer, fillLayer, lineLayer, curveFill, singleCurve, curveLayer] {
             self.layer?.addSublayer(layer)
         }
         if editsBands {
@@ -206,11 +198,7 @@ final class SpectrumNSView: NSView, PlaybackDisplay {
         super.layout()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        let plot = plot
-        barsGradient.frame = plot
-        barsMask.frame = barsGradient.bounds
-        fillGradient.frame = plot
-        fillMask.frame = fillGradient.bounds
+        barsLayer.frame = plot
         drawGrid()
         updateCurve()
         updateHandles()
@@ -229,8 +217,8 @@ final class SpectrumNSView: NSView, PlaybackDisplay {
         let plot = plot
         guard levels.count > 2, binWidth > 0, plot.width > 4 else {
             lineLayer.path = nil
-            fillMask.path = nil
-            barsMask.path = nil
+            fillLayer.path = nil
+            bars.forEach { $0.isHidden = true }
             return
         }
         let key = [Double(plot.width), Double(levels.count), binWidth, settings.tilt, Double(SpectrumSettings.Scale.allCases.firstIndex(of: settings.scale) ?? 0)]
@@ -238,16 +226,17 @@ final class SpectrumNSView: NSView, PlaybackDisplay {
             lineColumns = makeColumns(count: max(Int(plot.width / 2), 2), binWidth: binWidth, binCount: levels.count)
             barColumns = makeColumns(count: editsBands ? max(24, Int(plot.width / 10)) : 28, binWidth: binWidth, binCount: levels.count)
             columnsKey = key
+            makeBars()
         }
 
         let showsBars = settings.style != .line
         let showsLine = settings.style != .bars
         let filled = settings.style == .line
-        barsGradient.isHidden = !showsBars
-        fillGradient.isHidden = !filled
+        barsLayer.isHidden = !showsBars
+        fillLayer.isHidden = !filled
         lineLayer.isHidden = !showsLine
         lineLayer.strokeColor = filled ? Self.lineColor.cgColor : NSColor(white: 1, alpha: 0.9).cgColor
-        barsGradient.opacity = settings.style == .both ? 0.8 : 0.95
+        barsLayer.opacity = settings.style == .both ? 0.8 : 0.95
 
         levels.withUnsafeBufferPointer { levels in
             if showsLine {
@@ -259,27 +248,36 @@ final class SpectrumNSView: NSView, PlaybackDisplay {
                 }
                 lineLayer.path = line
                 if filled {
-                    // The mask sits in the gradient's own coordinates.
                     let area = CGMutablePath()
-                    area.addPath(line, transform: CGAffineTransform(translationX: -plot.minX, y: -plot.minY))
-                    area.addLine(to: CGPoint(x: plot.width, y: 0))
-                    area.addLine(to: CGPoint(x: 0, y: 0))
+                    area.addPath(line)
+                    area.addLine(to: CGPoint(x: plot.maxX, y: plot.minY))
+                    area.addLine(to: CGPoint(x: plot.minX, y: plot.minY))
                     area.closeSubpath()
-                    fillMask.path = area
+                    fillLayer.path = area
                 }
             }
             if showsBars {
-                let bars = CGMutablePath()
                 let width = plot.width / CGFloat(barColumns.count)
                 let gap = max(1, width * 0.18)
-                for (index, column) in barColumns.enumerated() {
+                for (index, column) in barColumns.enumerated() where index < bars.count {
                     let top = height(of: value(column, levels), in: plot) - plot.minY
-                    guard top > 0.5 else { continue }
-                    bars.addRect(CGRect(x: CGFloat(index) * width + gap / 2, y: 0, width: width - gap, height: top))
+                    bars[index].isHidden = top <= 0.5
+                    bars[index].frame = CGRect(x: CGFloat(index) * width + gap / 2, y: 0, width: width - gap, height: max(top, 0))
                 }
-                barsMask.path = bars
             }
         }
+    }
+
+    /// One plain layer per bar, red at the low end through to violet at the top, like MiniMeters' colour bars.
+    private func makeBars() {
+        bars = barColumns.indices.map { index in
+            let bar = CALayer()
+            let hue = 0.78 * (Double(index) + 0.5) / Double(barColumns.count)
+            bar.backgroundColor = NSColor(hue: hue, saturation: 0.72, brightness: 0.95, alpha: 1).cgColor
+            bar.cornerRadius = 1.5
+            return bar
+        }
+        barsLayer.sublayers = bars
     }
 
     private func value(_ column: Column, _ levels: UnsafeBufferPointer<Float>) -> Float {

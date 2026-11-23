@@ -284,11 +284,13 @@ final class MeterNSView: NSView, PlaybackDisplay {
     private static let marks: [Float] = [6, 3, 0, -3, -6, -9, -12, -15, -18, -21, -24, -30, -35, -40, -45, -50, -60]
     private static let lowest: Float = -60
 
+    /// Plain layers, no masks: green, yellow, and red pieces that grow with the level.
     private struct Channel {
         let track = CALayer()
         let over = CALayer()
-        let zones = CAGradientLayer()
-        let reach = CALayer()
+        let green = CALayer()
+        let yellow = CALayer()
+        let red = CALayer()
         let average = CALayer()
         let hold = CALayer()
     }
@@ -304,11 +306,8 @@ final class MeterNSView: NSView, PlaybackDisplay {
         for channel in channels {
             channel.track.cornerRadius = 2
             channel.over.backgroundColor = NSColor.systemRed.withAlphaComponent(0.08).cgColor
-            channel.reach.backgroundColor = NSColor.black.cgColor
-            channel.zones.mask = channel.reach
-            channel.zones.opacity = 0.85
             channel.average.backgroundColor = NSColor(white: 1, alpha: 0.55).cgColor
-            for layer in [channel.track, channel.over, channel.zones, channel.average, channel.hold] {
+            for layer in [channel.track, channel.over, channel.green, channel.yellow, channel.red, channel.average, channel.hold] {
                 self.layer?.addSublayer(layer)
             }
         }
@@ -378,18 +377,14 @@ final class MeterNSView: NSView, PlaybackDisplay {
         let zeroY = Self.position(of: 0) * height
         bars = (0..<2).map { CGRect(x: barsLeft + CGFloat($0) * (barWidth + gap), y: 0, width: barWidth, height: height) }
 
-        // Green, yellow over the last 6 dB, red past full scale, as hard bands up the bar.
-        let six = NSNumber(value: Double(Self.position(of: -6)))
-        let full = NSNumber(value: Double(Self.position(of: 0)))
+        // Green, yellow over the last 6 dB, red past full scale.
         for (channel, bar) in zip(channels, bars) {
             channel.track.frame = bar
             channel.track.backgroundColor = colors.track
             channel.over.frame = CGRect(x: bar.minX, y: zeroY, width: bar.width, height: height - zeroY)
-            channel.zones.frame = bar
-            channel.zones.colors = [NSColor.systemGreen, .systemGreen, .systemYellow, .systemYellow, .systemRed, .systemRed].map(\.cgColor)
-            channel.zones.locations = [0, six, six, full, full, 1]
-            channel.zones.startPoint = CGPoint(x: 0.5, y: 0)
-            channel.zones.endPoint = CGPoint(x: 0.5, y: 1)
+            channel.green.backgroundColor = NSColor.systemGreen.withAlphaComponent(0.85).cgColor
+            channel.yellow.backgroundColor = NSColor.systemYellow.withAlphaComponent(0.85).cgColor
+            channel.red.backgroundColor = NSColor.systemRed.withAlphaComponent(0.85).cgColor
             channel.hold.backgroundColor = colors.primary
         }
         zero.frame = CGRect(x: barsLeft - 1, y: zeroY - 0.5, width: barWidth * 2 + gap + 2, height: 1)
@@ -422,7 +417,12 @@ final class MeterNSView: NSView, PlaybackDisplay {
         defer { CATransaction.commit() }
         for (index, channel) in channels.enumerated() {
             let bar = bars[index]
-            channel.reach.frame = CGRect(x: 0, y: 0, width: bar.width, height: Self.position(of: reading.peak[index]) * bar.height)
+            let level = Self.position(of: reading.peak[index]) * bar.height
+            let six = Self.position(of: -6) * bar.height
+            let full = Self.position(of: 0) * bar.height
+            channel.green.frame = CGRect(x: bar.minX, y: 0, width: bar.width, height: min(level, six))
+            channel.yellow.frame = CGRect(x: bar.minX, y: six, width: bar.width, height: max(min(level, full) - six, 0))
+            channel.red.frame = CGRect(x: bar.minX, y: full, width: bar.width, height: max(level - full, 0))
             let average = Self.position(of: reading.rms[index]) * bar.height
             channel.average.frame = CGRect(x: bar.minX + bar.width * 0.3, y: 0, width: bar.width * 0.4, height: average)
             if reading.hold[index] > Self.lowest {

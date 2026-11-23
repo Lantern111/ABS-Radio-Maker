@@ -227,11 +227,14 @@ import UniformTypeIdentifiers
                 // recording is let go of as soon as the file is written.
                 let (windows, moments, segments, source) = try await withTaskCancellationHandler {
                     try await Task.detached(priority: .userInitiated) {
+                        let reading = ProgressGate(), finding = ProgressGate(), detecting = ProgressGate()
                         let clip = try AudioClip.load(from: url) { fraction in
+                            guard reading.passes(fraction) else { return }
                             Task { @MainActor in self?.updateWorking("녹음 파일을 읽는 중…", fraction) }
                         }
                         if cancel.isSet { throw CancellationError() }
                         let windows = try ContentDetector.classify(clip) { fraction in
+                            guard finding.passes(fraction) else { return }
                             Task { @MainActor in self?.updateWorking("노래 구간을 찾는 중…", fraction) }
                         } isCancelled: {
                             cancel.isSet
@@ -241,6 +244,7 @@ import UniformTypeIdentifiers
                         var moments: [TalkDetector.Moment]?
                         if let url = TalkDetector.bundledModel, let model = try? TalkDetector.loadModel(at: url) {
                             moments = try TalkDetector.detect(clip, model: model) { fraction in
+                                guard detecting.passes(fraction) else { return }
                                 Task { @MainActor in self?.updateWorking("말하는 순간을 찾는 중…", fraction) }
                             } isCancelled: {
                                 cancel.isSet
@@ -349,7 +353,10 @@ import UniformTypeIdentifiers
                         segments: Self.outputSegments(segments, map: cleaned.timeMap),
                         transition: transition
                     )
+                    let gate = ProgressGate()
                     plugged = try PluginRenderer.render(consume cleaned, inserts: inserts, envelope: envelope) { fraction in
+                        // Hundreds of blocks a second report progress; the bar only needs a few of them.
+                        guard gate.passes(fraction) else { return }
                         Task { @MainActor in
                             if quietly {
                                 self.applyingPlugins = fraction
@@ -677,6 +684,7 @@ import UniformTypeIdentifiers
         let performance = performance
         let images = layers.images
         let settings = settings
+        let gate = ProgressGate()
         Task { [weak self] in
             do {
                 try await VideoExporter.export(
@@ -686,6 +694,7 @@ import UniformTypeIdentifiers
                     settings: settings,
                     to: url,
                     progress: { progress in
+                        guard gate.passes(progress.fraction) else { return }
                         Task { @MainActor in
                             guard let self, self.export?.finishedURL == nil else { return }
                             self.export?.fraction = progress.fraction
@@ -725,7 +734,9 @@ import UniformTypeIdentifiers
                     let settings = isWAV
                         ? AudioClip.wavSettings(sampleRate: clip.sampleRate, channels: clip.channels.count)
                         : AudioClip.aacSettings(sampleRate: clip.sampleRate, channels: clip.channels.count)
+                    let gate = ProgressGate()
                     try clip.write(to: url, settings: settings) { fraction in
+                        guard gate.passes(fraction) else { return }
                         Task { @MainActor in self?.export?.fraction = fraction }
                     }
                 }.value
@@ -739,6 +750,24 @@ import UniformTypeIdentifiers
 
     func cancelExport() {
         exportCancel.set()
+    }
+}
+
+/// Lets through progress only when it has moved on a little, or at most ten times a second, so work reporting
+/// every block doesn't flood the main thread with updates to a progress bar.
+final class ProgressGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var last = -1.0
+    private var lastTime = 0.0
+
+    func passes(_ fraction: Double) -> Bool {
+        let now = ProcessInfo.processInfo.systemUptime
+        return lock.withLock {
+            guard fraction >= 1 || (fraction - last >= 0.005 && now - lastTime >= 0.1) else { return false }
+            last = fraction
+            lastTime = now
+            return true
+        }
     }
 }
 

@@ -1,4 +1,5 @@
 import Accelerate
+import AppKit
 import AVFoundation
 import Observation
 import os
@@ -66,7 +67,8 @@ struct PlayerInsert {
     @ObservationIgnored private(set) var meter = MeterReading.silent
     @ObservationIgnored let spectrum = SpectrumAnalyzer()
     @ObservationIgnored private var displays: [WeakDisplay] = []
-    @ObservationIgnored private var ticks = 0
+    @ObservationIgnored private var lastTick: CFTimeInterval?
+    @ObservationIgnored private var lastReadouts: CFTimeInterval = 0
 
     private struct WeakDisplay {
         weak var display: (any PlaybackDisplay)?
@@ -93,7 +95,10 @@ struct PlayerInsert {
     @ObservationIgnored private var scheduledFrom: AVAudioFramePosition = 0
     /// Goes up with every new schedule, so a finished-playing message from an old one is ignored.
     @ObservationIgnored private var generation = 0
-    @ObservationIgnored private var clock: Timer?
+    /// Steps in time with the screen's refresh, so what moves on screen moves evenly. Nil while resting.
+    @ObservationIgnored private var clock: CADisplayLink?
+    @ObservationIgnored private var fallbackClock: Timer?
+    @ObservationIgnored private lazy var clockTarget = ClockTarget(player: self)
     @ObservationIgnored private let output = OutputTap()
     @ObservationIgnored private var holdSince: [Date] = [.distantPast, .distantPast]
     @ObservationIgnored private var stoppedAt: Date?
@@ -355,13 +360,43 @@ struct PlayerInsert {
     // MARK: - Clock, meter, and spectrum
 
     private func startClock() {
-        guard clock == nil else { return }
-        let clock = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.tick() }
-        }
+        guard clock == nil, fallbackClock == nil else { return }
+        lastTick = nil
         // The common mode keeps it running while a slider or the timeline is being dragged.
-        RunLoop.main.add(clock, forMode: .common)
-        self.clock = clock
+        if let screen = NSScreen.main {
+            let link = screen.displayLink(target: clockTarget, selector: #selector(ClockTarget.step(_:)))
+            // 30 steps a second, in time with the screen: even, and half the drawing of 60, which older Macs feel.
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 30, preferred: 30)
+            link.add(to: .main, forMode: .common)
+            clock = link
+        } else {
+            let timer = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.tick(at: CACurrentMediaTime()) }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            fallbackClock = timer
+        }
+    }
+
+    private func stopClock() {
+        clock?.invalidate()
+        clock = nil
+        fallbackClock?.invalidate()
+        fallbackClock = nil
+    }
+
+    /// Hands the display link's steps to the player, which isn't an Objective-C object.
+    private final class ClockTarget: NSObject {
+        weak var player: PreviewPlayer?
+
+        init(player: PreviewPlayer) {
+            self.player = player
+        }
+
+        @objc func step(_ link: CADisplayLink) {
+            let timestamp = link.timestamp
+            MainActor.assumeIsolated { player?.tick(at: timestamp) }
+        }
     }
 
     private func refreshDisplays() {
@@ -370,34 +405,36 @@ struct PlayerInsert {
         }
     }
 
-    private func tick() {
+    private func tick(at timestamp: CFTimeInterval) {
         isTicking = true
         defer { isTicking = false }
+        // How long since the last step, so falls and smoothing run at the same speed at any refresh rate.
+        let elapsed = min(max(timestamp - (lastTick ?? timestamp - 1.0 / 60), 0.001), 0.1)
+        lastTick = timestamp
         if isPlaying {
             time = min(position, duration)
             applyBlends(at: time)
         }
-        updateMeter()
+        updateMeter(elapsed: elapsed, now: timestamp)
         let showing = displays.compactMap(\.display).filter(\.isShowing)
         if showing.contains(where: \.showsSpectrum) {
-            spectrum.update(from: output, sampleRate: format.sampleRate)
+            spectrum.update(from: output, sampleRate: format.sampleRate, elapsed: elapsed)
         }
         // After stopping, the meter and spectrum fall back to silence, then the clock rests.
         if !isPlaying, let stoppedAt, Date().timeIntervalSince(stoppedAt) > 2 {
-            clock?.invalidate()
-            clock = nil
+            stopClock()
             var silent = MeterReading.silent
             silent.clipped = meter.clipped
             silent.highest = meter.highest
             meter = silent
             spectrum.clear()
-            updateReadouts(force: true)
+            updateReadouts(force: true, now: timestamp)
         }
         for display in showing { display.refresh() }
     }
 
     /// The readouts follow the meter five times a second, and at once when the highest peak or the clip light changes.
-    private func updateReadouts(force: Bool = false) {
+    private func updateReadouts(force: Bool = false, now: CFTimeInterval = CACurrentMediaTime()) {
         func tenths(_ value: Double?) -> Double? { value.map { ($0 * 10).rounded() / 10 } }
         let fresh = MeterReadouts(
             highest: (meter.highest * 10).rounded() / 10,
@@ -407,12 +444,15 @@ struct PlayerInsert {
         )
         guard fresh != readouts else { return }
         let urgent = fresh.highest != readouts.highest || fresh.clipped != readouts.clipped
-        if force || urgent || ticks % 6 == 0 { readouts = fresh }
+        if force || urgent || now - lastReadouts >= 0.2 {
+            readouts = fresh
+            lastReadouts = now
+        }
     }
 
-    private func updateMeter() {
+    private func updateMeter(elapsed: CFTimeInterval, now timestamp: CFTimeInterval) {
         let fresh = output.takeLevels()
-        let fall: Float = 26.0 / 30 // dB per tick: 26 dB a second, like a desk meter
+        let fall = Float(26 * elapsed) // 26 dB a second, like a desk meter
         let now = Date()
         var reading = meter
         for channel in 0..<2 {
@@ -432,8 +472,7 @@ struct PlayerInsert {
         reading.momentary = fresh.momentary
         reading.shortTerm = fresh.shortTerm
         meter = reading
-        ticks += 1
-        updateReadouts()
+        updateReadouts(now: timestamp)
     }
 }
 

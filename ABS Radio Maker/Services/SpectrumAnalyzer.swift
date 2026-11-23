@@ -29,7 +29,8 @@ import Accelerate
     private var outImaginary: [Float] = []
     private var fresh: [Float] = []
 
-    func update(from tap: OutputTap, sampleRate: Double) {
+    /// `elapsed` is the time since the last update, so smoothing looks the same at any refresh rate.
+    func update(from tap: OutputTap, sampleRate: Double, elapsed: Double = 1.0 / 30) {
         prepare()
         let size = setupSize
         let half = size / 2
@@ -79,8 +80,8 @@ import Accelerate
             levels = fresh
             return
         }
-        // Rises come through faster than falls, as on a desk analyzer.
-        let fall = 1 - min(max(smoothing, 0), 0.99)
+        // Rises come through faster than falls, as on a desk analyzer. Smoothing is set as per 1/30 s.
+        let fall = 1 - pow(min(max(smoothing, 0), 0.99), Float(elapsed * 30))
         let rise = min(1, fall * 3)
         levels.withUnsafeMutableBufferPointer { levels in
             fresh.withUnsafeBufferPointer { fresh in
