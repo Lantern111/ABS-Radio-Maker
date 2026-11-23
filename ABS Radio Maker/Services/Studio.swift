@@ -685,7 +685,8 @@ import UniformTypeIdentifiers
         let images = layers.images
         let settings = settings
         let gate = ProgressGate()
-        Task { [weak self] in
+        // Someone is waiting on this, so it runs as user work: lower priorities get their disk writes held back.
+        Task(priority: .userInitiated) { [weak self] in
             do {
                 try await VideoExporter.export(
                     audio: processed.clip,
