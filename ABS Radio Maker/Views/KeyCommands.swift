@@ -210,7 +210,7 @@ struct ShortcutsSheet: View {
         VStack(alignment: .leading, spacing: 16) {
             Text("키보드 단축키")
                 .font(.title2.weight(.semibold))
-            Text("파이널컷 프로와 같은 키를 써요.")
+            Text("재생, 구간 편집, 타임라인을 키보드로 다룰 수 있어요.")
                 .foregroundStyle(.secondary)
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
