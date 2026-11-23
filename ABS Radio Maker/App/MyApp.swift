@@ -90,4 +90,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
     }
+
+    /// Before anything is opened, clears out working files a previous run left behind, say after a crash.
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        Self.removeWorkingFiles()
+    }
+
+    /// The decoded recording and the preview are each as big as the recording, so they don't outlive the app.
+    func applicationWillTerminate(_ notification: Notification) {
+        Self.removeWorkingFiles()
+    }
+
+    /// The recording's samples (source-), the preview's sound (preview-), and export work folders (export-), all in
+    /// the app's own temporary folder.
+    private static func removeWorkingFiles() {
+        let folder = FileManager.default.temporaryDirectory
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
+        for name in names where ["source-", "preview-", "export-"].contains(where: name.hasPrefix) {
+            try? FileManager.default.removeItem(at: folder.appending(path: name))
+        }
+    }
 }

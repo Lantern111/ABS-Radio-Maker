@@ -26,7 +26,8 @@ enum VideoExporter {
         var message: String
     }
 
-    static func export(
+    /// Runs away from the main thread, so the window keeps answering while a long show is written.
+    @concurrent static func export(
         audio: AudioClip,
         performance: Performance,
         images: [LayerSlot: CGImage],
@@ -105,55 +106,188 @@ enum VideoExporter {
         let started = Date()
         let frameCount = performance.frameCount
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
-        for frame in 0..<frameCount {
-            if isCancelled() {
-                writer.cancelWriting()
-                throw CancellationError()
-            }
-            while !input.isReadyForMoreMediaData {
-                if writer.status == .failed {
-                    throw VideoExportError.writerFailed(writer.error?.localizedDescription ?? "unknown")
+        let backdrops = Backdrops(renderer: renderer, settings: settings, pose: performance.pose(at: 0, swayAmount: 0), colorSpace: colorSpace)
+        // Frames don't depend on each other, so a batch is drawn on several cores at once and handed to the encoder in
+        // order, while the next batch is already being drawn.
+        let workers = max(1, min(ProcessInfo.processInfo.activeProcessorCount - 1, 8))
+        let batchSize = workers * 2
+        guard let pool = adaptor.pixelBufferPool else {
+            throw VideoExportError.writerFailed(writer.error?.localizedDescription ?? "pixel buffer pool")
+        }
+        let drawing = BatchDrawer(pool: pool, performance: performance, renderer: renderer, backdrops: backdrops,
+                                  settings: settings, colorSpace: colorSpace)
+        var pending: Task<BufferBox, Error>? = drawing.start(first: 0, count: min(batchSize, frameCount))
+        var frame = 0
+        while let current = pending {
+            let batch = try await current.value
+            let first = frame
+            frame += batch.buffers.count
+            pending = frame < frameCount ? drawing.start(first: frame, count: min(batchSize, frameCount - frame)) : nil
+
+            for (index, pixelBuffer) in batch.buffers.enumerated() {
+                if isCancelled() {
+                    pending?.cancel()
+                    writer.cancelWriting()
+                    throw CancellationError()
                 }
-                try await Task.sleep(for: .milliseconds(2))
+                while !input.isReadyForMoreMediaData {
+                    if writer.status == .failed {
+                        throw VideoExportError.writerFailed(writer.error?.localizedDescription ?? "unknown")
+                    }
+                    try await Task.sleep(for: .milliseconds(2))
+                }
+                if !adaptor.append(pixelBuffer, withPresentationTime: CMTime(value: CMTimeValue(first + index), timescale: fps)) {
+                    throw VideoExportError.writerFailed(writer.error?.localizedDescription ?? "append")
+                }
             }
 
-            var pixelBuffer: CVPixelBuffer?
-            guard let pool = adaptor.pixelBufferPool,
-                  CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pixelBuffer) == kCVReturnSuccess,
-                  let pixelBuffer
-            else { throw VideoExportError.writerFailed(writer.error?.localizedDescription ?? "pixel buffer") }
-
-            CVPixelBufferLockBaseAddress(pixelBuffer, [])
-            if let context = CGContext(
-                data: CVPixelBufferGetBaseAddress(pixelBuffer),
-                width: Int(size.width),
-                height: Int(size.height),
-                bitsPerComponent: 8,
-                bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer),
-                space: colorSpace,
-                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
-            ) {
-                renderer.draw(in: context, pose: performance.pose(at: frame, swayAmount: settings.swayAmount), settings: settings)
-            }
-            CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
-
-            if !adaptor.append(pixelBuffer, withPresentationTime: CMTime(value: CMTimeValue(frame), timescale: fps)) {
-                throw VideoExportError.writerFailed(writer.error?.localizedDescription ?? "append")
-            }
-
-            if frame % 30 == 0 || frame == frameCount - 1 {
-                let done = Double(frame + 1) / Double(frameCount)
-                let elapsed = Date().timeIntervalSince(started)
-                // A guess at the time left is only steady after a few seconds.
-                let remaining = elapsed > 5 ? elapsed / done * (1 - done) : nil
-                progress(done, remaining)
-            }
+            let done = Double(frame) / Double(frameCount)
+            let elapsed = Date().timeIntervalSince(started)
+            // A guess at the time left is only steady after a few seconds.
+            let remaining = elapsed > 5 ? elapsed / done * (1 - done) : nil
+            progress(done, remaining)
         }
 
         input.markAsFinished()
         await writer.finishWriting()
         if writer.status != .completed {
             throw VideoExportError.writerFailed(writer.error?.localizedDescription ?? "finish")
+        }
+    }
+
+    /// Pixel buffers handed to the threads drawing a batch. Each thread only touches its own.
+    private struct BufferBox: @unchecked Sendable {
+        let buffers: [CVPixelBuffer]
+
+        init(_ buffers: [CVPixelBuffer]) {
+            self.buffers = buffers
+        }
+    }
+
+    /// Draws batches of frames into new pixel buffers, on several cores, away from the encoding.
+    private struct BatchDrawer: @unchecked Sendable {
+        let pool: CVPixelBufferPool
+        let performance: Performance
+        let renderer: FrameRenderer
+        let backdrops: Backdrops
+        let settings: StudioSettings
+        let colorSpace: CGColorSpace
+
+        func start(first: Int, count: Int) -> Task<BufferBox, Error> {
+            Task.detached(priority: .utility) {
+                var buffers: [CVPixelBuffer] = []
+                for _ in 0..<count {
+                    var pixelBuffer: CVPixelBuffer?
+                    guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pixelBuffer) == kCVReturnSuccess, let pixelBuffer else {
+                        throw VideoExportError.writerFailed("pixel buffer")
+                    }
+                    buffers.append(pixelBuffer)
+                }
+                let batch = BufferBox(buffers)
+                DispatchQueue.concurrentPerform(iterations: count) { index in
+                    VideoExporter.drawFrame(first + index, into: batch.buffers[index], performance: performance, renderer: renderer,
+                                            backdrops: backdrops, settings: settings, colorSpace: colorSpace)
+                }
+                return batch
+            }
+        }
+    }
+
+    /// Draws one frame into a pixel buffer. Safe to run for different frames at once.
+    private static func drawFrame(
+        _ frame: Int,
+        into pixelBuffer: CVPixelBuffer,
+        performance: Performance,
+        renderer: FrameRenderer,
+        backdrops: Backdrops,
+        settings: StudioSettings,
+        colorSpace: CGColorSpace
+    ) {
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        guard let base = CVPixelBufferGetBaseAddress(pixelBuffer), let context = CGContext(
+            data: base,
+            width: Int(size.width),
+            height: Int(size.height),
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        ) else { return }
+        let pose = performance.pose(at: frame, swayAmount: settings.swayAmount)
+        if renderer.isFading(pose) {
+            // The song background part way in: drawn in full, which only a second or so of each fade needs.
+            renderer.draw(in: context, pose: pose, settings: settings)
+            return
+        }
+        // The parts that don't move come from the backdrop. Only around the character is anything drawn: the backdrop
+        // without the desk, then the character, then the desk in front.
+        let music = renderer.musicBackground != nil && pose.listening >= 0.999
+        backdrops.copy(music: music, desk: true, into: base, bytesPerRow: bytesPerRow, area: nil)
+        if let box = renderer.characterBox(pose: pose, settings: settings) {
+            backdrops.copy(music: music, desk: false, into: base, bytesPerRow: bytesPerRow, area: box)
+            renderer.draw(in: context, pose: pose, settings: settings, parts: [.character, .desk], listening: pose.listening, clip: box)
+        }
+    }
+
+    /// Everything that doesn't move, drawn once: with and without the song background, each with and without the desk.
+    /// Only read once made, so the threads drawing frames share it.
+    private final class Backdrops: @unchecked Sendable {
+        private let width: Int
+        private let height: Int
+        private let bytesPerRow: Int
+        private var pictures: [Int: [UInt8]] = [:]
+
+        init(renderer: FrameRenderer, settings: StudioSettings, pose: Performance.Pose, colorSpace: CGColorSpace) {
+            width = Int(renderer.size.width)
+            height = Int(renderer.size.height)
+            bytesPerRow = width * 4
+            let musicChoices = renderer.musicBackground == nil ? [false] : [false, true]
+            for music in musicChoices {
+                for desk in [false, true] {
+                    var pixels = [UInt8](repeating: 0, count: bytesPerRow * height)
+                    pixels.withUnsafeMutableBytes { bytes in
+                        guard let context = CGContext(
+                            data: bytes.baseAddress,
+                            width: width,
+                            height: height,
+                            bitsPerComponent: 8,
+                            bytesPerRow: bytesPerRow,
+                            space: colorSpace,
+                            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+                        ) else { return }
+                        renderer.draw(
+                            in: context,
+                            pose: pose,
+                            settings: settings,
+                            parts: desk ? [.backdrop, .desk] : [.backdrop],
+                            listening: music ? 1 : 0
+                        )
+                    }
+                    pictures[Self.key(music: music, desk: desk)] = pixels
+                }
+            }
+        }
+
+        private static func key(music: Bool, desk: Bool) -> Int { (music ? 2 : 0) + (desk ? 1 : 0) }
+
+        /// Copies a backdrop into a frame, all of it or just an area given in top-left-origin pixels. Rows in memory
+        /// run from the top, so the area's rows are the rows to copy.
+        func copy(music: Bool, desk: Bool, into destination: UnsafeMutableRawPointer, bytesPerRow destinationRow: Int, area: CGRect?) {
+            guard let pixels = pictures[Self.key(music: music, desk: desk)] else { return }
+            let left = area.map { max(Int($0.minX), 0) } ?? 0
+            let right = area.map { min(Int($0.maxX), width) } ?? width
+            let top = area.map { max(Int($0.minY), 0) } ?? 0
+            let bottom = area.map { min(Int($0.maxY), height) } ?? height
+            guard right > left, bottom > top else { return }
+            let length = (right - left) * 4
+            pixels.withUnsafeBytes { source in
+                for row in top..<bottom {
+                    (destination + row * destinationRow + left * 4)
+                        .copyMemory(from: source.baseAddress! + row * bytesPerRow + left * 4, byteCount: length)
+                }
+            }
         }
     }
 

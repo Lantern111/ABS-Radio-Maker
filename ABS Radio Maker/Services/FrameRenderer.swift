@@ -52,38 +52,81 @@ final class FrameRenderer: @unchecked Sendable {
 
     /// Draws a frame into a context whose origin is at the bottom left, as Core Graphics contexts usually are.
     func draw(in context: CGContext, pose: Performance.Pose, settings: StudioSettings, quality: CGInterpolationQuality = .high) {
+        draw(in: context, pose: pose, settings: settings, quality: quality, parts: .all, listening: pose.listening)
+    }
+
+    /// Which parts of a frame to draw. The export draws the parts that don't move once, and only the character, with the
+    /// desk in front of it, in each frame.
+    struct Parts: OptionSet {
+        let rawValue: Int
+        /// The background, the song background, and the corner cover.
+        static let backdrop = Parts(rawValue: 1)
+        static let character = Parts(rawValue: 2)
+        static let desk = Parts(rawValue: 4)
+        static let all: Parts = [.backdrop, .character, .desk]
+    }
+
+    /// `clip` keeps the drawing to part of the screen, in top-left-origin screen coordinates.
+    func draw(
+        in context: CGContext,
+        pose: Performance.Pose,
+        settings: StudioSettings,
+        quality: CGInterpolationQuality = .high,
+        parts: Parts,
+        listening: Double,
+        clip: CGRect? = nil
+    ) {
         context.saveGState()
         defer { context.restoreGState() }
         context.interpolationQuality = quality
         // From here on, the origin is at the top left.
         context.translateBy(x: 0, y: size.height)
         context.scaleBy(x: 1, y: -1)
+        if let clip { context.clip(to: clip) }
 
         let screen = CGRect(origin: .zero, size: size)
-        if let background {
-            draw(background, in: screen, context: context)
-        } else {
-            context.setFillColor(gray: 0.12, alpha: 1)
-            context.fill(screen)
-        }
-        if let musicBackground, pose.listening > 0 {
-            context.saveGState()
-            context.setAlpha(pose.listening)
-            draw(musicBackground, in: screen, context: context)
-            context.restoreGState()
+        if parts.contains(.backdrop) {
+            if let background {
+                draw(background, in: screen, context: context)
+            } else {
+                context.setFillColor(gray: 0.12, alpha: 1)
+                context.fill(screen)
+            }
+            if let musicBackground, listening > 0 {
+                context.saveGState()
+                context.setAlpha(listening)
+                draw(musicBackground, in: screen, context: context)
+                context.restoreGState()
+            }
+            if let cover = coverArt(settings: settings) {
+                draw(cover.image, in: cover.rect, context: context)
+            }
         }
 
-        if let cover = coverArt(settings: settings) {
-            draw(cover.image, in: cover.rect, context: context)
-        }
-
-        if let character = character(for: pose.drawing) {
+        if parts.contains(.character), let character = character(for: pose.drawing) {
             drawCharacter(character, pose: pose, settings: settings, context: context)
         }
 
-        if let desk {
+        if parts.contains(.desk), let desk {
             draw(desk.image, in: desk.rect, context: context)
         }
+    }
+
+    /// The part of the screen the character covers in a pose, in whole pixels with a little room for smoothing at
+    /// the edges, in top-left-origin screen coordinates. Nil without a character.
+    func characterBox(pose: Performance.Pose, settings: StudioSettings) -> CGRect? {
+        guard let character = character(for: pose.drawing) else { return nil }
+        let box = character.rect
+            .applying(characterTransform(pose: pose, settings: settings))
+            .insetBy(dx: -3, dy: -3)
+            .integral
+            .intersection(CGRect(origin: .zero, size: size))
+        return box.isNull || box.isEmpty ? nil : box
+    }
+
+    /// Whether the song background is part way in, which the export can't take from a backdrop made in advance.
+    func isFading(_ pose: Performance.Pose) -> Bool {
+        musicBackground != nil && pose.listening > 0.001 && pose.listening < 0.999
     }
 
     /// The corner cover, fitted into the frame on the wall, behind glass. Nil without a cover. Made again only when the
